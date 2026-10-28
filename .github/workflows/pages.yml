@@ -1,0 +1,54 @@
+name: Deploy web to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      # The static build has one knob: where the API lives. The token is never
+      # written here — it is entered on the device and kept in localStorage.
+      - name: Bake backend URL
+        run: |
+          url="${{ vars.RAVAN_BACKEND_URL }}"
+          if [ -z "$url" ]; then
+            echo "::warning::RAVAN_BACKEND_URL is not set. The page will open Settings and ask for a URL."
+          fi
+          cat > web/config.js <<EOF
+          window.RAVAN_CONFIG = {
+            backendUrl: "${url}",
+            apiToken: "",
+            version: "${GITHUB_SHA::8}"
+          };
+          EOF
+          test -f web/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

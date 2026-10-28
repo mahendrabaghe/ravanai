@@ -1,0 +1,17 @@
+{
+  "appId": "ai.ravan.assistant",
+  "appName": "RAVAN AI",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#02070c"
+  },
+  "plugins": {
+    "SpeechRecognition": {
+      "partialResults": true
+    }
+  }
+}

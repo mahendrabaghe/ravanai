@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="colorPrimary">#00D4FF</color>
+    <color name="colorPrimaryDark">#02070C</color>
+    <color name="colorAccent">#7FE9FF</color>
+    <color name="ravanBg">#02070C</color>
+    <color name="ravanPanel">#06121B</color>
+    <color name="ravanCyan">#00D4FF</color>
+    <color name="ravanViolet">#6F7DFF</color>
+    <color name="ravanRed">#FF5C7A</color>
+</resources>

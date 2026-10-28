@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="theme-color" content="#02070c">
+  <meta name="description" content="RAVAN AI — your phone assistant. Voice, text and device actions.">
+  <title>RAVAN AI</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/app-icon-512.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app" id="app">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">RAVAN</span>
+        <span class="brand-sub">AI</span>
+      </div>
+      <div class="top-right">
+        <span class="net" id="net-state" role="status">CONNECTING</span>
+        <button class="icon-btn" id="settings-btn" aria-label="Settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8.4 3.5c0-.5 0-.9-.1-1.4l2-1.6-1.9-3.3-2.4 1a7.6 7.6 0 0 0-2.4-1.4L15.3 2h-3.8l-.4 2.4c-.9.3-1.7.8-2.4 1.4l-2.4-1L4.4 8l2 1.6a8 8 0 0 0 0 2.8l-2 1.6 1.9 3.3 2.4-1c.7.6 1.5 1.1 2.4 1.4l.4 2.4h3.8l.4-2.4c.9-.3 1.7-.8 2.4-1.4l2.4 1 1.9-3.3-2-1.6c.1-.5.1-.9.1-1.4Z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="offline-banner" id="offline-banner" hidden role="alert">
+      <span id="offline-text">Backend unreachable.</span>
+      <button type="button" id="offline-retry">Retry</button>
+    </div>
+
+    <main class="stage">
+      <div class="avatar-wrap">
+        <canvas id="avatar" aria-label="RAVAN's animated face"></canvas>
+        <div class="status-row">
+          <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+          <span class="status-label" id="state-label" role="status" aria-live="polite">STANDBY</span>
+          <button class="muted-chip" id="muted-chip" type="button" title="Unmute microphone" hidden>MIC MUTED</button>
+        </div>
+      </div>
+
+      <section class="transcript" id="transcript" aria-live="polite" aria-label="Conversation">
+        <div class="empty-hint" id="empty-hint">
+          <p>Tap the microphone and speak, or type a command.</p>
+          <p class="dim">Try “Open YouTube”, “Play Believer”, “Open WhatsApp”.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="dock">
+      <div class="composer glass">
+        <button class="mic-btn" id="mic-btn" aria-label="Start listening" aria-pressed="false" title="Speak to RAVAN">
+          <svg class="ico-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2Z"/></svg>
+          <svg class="ico-mute" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18-1.4 1.4L3 4.4 3 3Zm9 11a3 3 0 0 0 3-3V6a3 3 0 0 0-5.6-1.5L15 12.7c-.6.8-1.5 1.3-2.5 1.3h-.5Zm5-3h2a7 7 0 0 1-3 5.7V21h-2v-3.1a7 7 0 0 1-2-.7l1.5-1.5c.4.2.9.3 1.5.3a5 5 0 0 0 5-5v-1Z"/></svg>
+        </button>
+        <input id="text-input" class="text-input" type="text" inputmode="text"
+               autocomplete="off" autocapitalize="sentences" spellcheck="false"
+               maxlength="2000" placeholder="Type a command…" aria-label="Command">
+        <button class="stop-btn" id="stop-btn" aria-label="Stop" title="Stop speaking" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <button class="send-btn" id="send-btn" aria-label="Send" title="Send">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 21 3l-8.5 18-2.1-6.4L3 11.5Zm7.6 2.9 5.2-5.2-6.7 3.3 1.5 1.9Z"/></svg>
+        </button>
+      </div>
+      <p class="dock-hint" id="dock-hint">Voice needs microphone permission. Typing always works.</p>
+    </footer>
+  </div>
+
+  <!-- Settings sheet -->
+  <div class="sheet-backdrop" id="settings-sheet" hidden>
+    <section class="sheet glass" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <header class="sheet-head">
+        <h2 id="settings-title">SETTINGS</h2>
+        <button class="icon-btn" id="settings-close" aria-label="Close settings">✕</button>
+      </header>
+      <div class="sheet-body">
+        <label class="field">
+          <span>Backend URL</span>
+          <input id="cfg-backend" type="url" placeholder="https://your-service.onrender.com" autocomplete="url">
+          <small>For GitHub Pages builds. Leave empty when the backend serves this page.</small>
+        </label>
+        <label class="field">
+          <span>Access token <em>(optional)</em></span>
+          <input id="cfg-token" type="password" placeholder="Bearer token" autocomplete="off">
+          <small>Only needed if RAVAN_API_TOKEN is set on the server. Stored on this device only.</small>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="cfg-voice" checked>
+          <span>Speak replies aloud</span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="cfg-mic-muted">
+          <span>Microphone muted</span>
+        </label>
+        <div class="native-only" id="native-section" hidden>
+          <div class="sheet-divider">ANDROID</div>
+          <label class="toggle">
+            <input type="checkbox" id="cfg-floating">
+            <span>Floating RAVAN icon</span>
+          </label>
+          <p class="fine" id="floating-note">Requires the “display over other apps” permission. The icon has a mic toggle and opens the app on tap.</p>
+          <button class="btn ghost" id="btn-exit" type="button">Exit RAVAN</button>
+        </div>
+        <div class="about">
+          <span id="about-mode">Connected</span>
+          <span id="about-version">RAVAN mobile</span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- WhatsApp confirmation -->
+  <div class="sheet-backdrop" id="confirm-sheet" hidden>
+    <section class="sheet glass confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+      <header class="sheet-head">
+        <h2 id="confirm-title">CONFIRM WHATSAPP</h2>
+      </header>
+      <div class="sheet-body">
+        <p class="confirm-line">To: <strong id="confirm-contact">contact picker</strong></p>
+        <p class="confirm-msg" id="confirm-message"></p>
+        <p class="fine">WhatsApp opens with this text ready. RAVAN does not send anything; you choose the contact and press send.</p>
+        <div class="confirm-actions">
+          <button class="btn ghost" id="confirm-cancel" type="button">Cancel</button>
+          <button class="btn primary" id="confirm-ok" type="button">Open WhatsApp</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <script src="config.js"></script>
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>

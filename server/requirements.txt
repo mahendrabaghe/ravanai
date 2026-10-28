@@ -1,0 +1,7 @@
+# Cloud backend only. The desktop app keeps using the root requirements.txt.
+#
+# No GPU, no media stack, no Qt: the phone does speech recognition and TTS
+# locally, and this process only talks to Gemini and validates tool calls.
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+google-genai==2.33.0

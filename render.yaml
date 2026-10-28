@@ -1,0 +1,40 @@
+# Render Blueprint — one web service, no database.
+#
+# Deploy: push this repo, then in Render choose "New > Blueprint" and point it at
+# the repository. Fill GEMINI_API_KEY and RAVAN_API_TOKEN in the dashboard; they
+# are marked sync:false so they are never read from this file or committed.
+services:
+  - type: web
+    name: ravan-ai
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: uvicorn server.app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+
+      # Required for live answers. Without it /health reports ai_configured
+      # false and /api/chat returns 503 (set RAVAN_MOCK=1 to demo without a key).
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # Recommended on a public URL. A long random string; enter the same value
+      # in the app's Settings sheet. Sent as a bearer header, never in the URL.
+      - key: RAVAN_API_TOKEN
+        sync: false
+
+      # Pin this to the Pages origin and the APK's WebView origin. "*" works but
+      # lets any site call your endpoint with the token in its own page.
+      - key: ALLOWED_ORIGINS
+        value: "https://YOURNAME.github.io,https://localhost"
+
+      - key: RAVAN_MOCK
+        value: "0"
+      - key: RATE_LIMIT_PER_MIN
+        value: "30"
+      - key: CHAT_TIMEOUT_S
+        value: "35"

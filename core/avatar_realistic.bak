@@ -1,0 +1,1121 @@
+"""
+Holographic AI head for the HUD centre — the thing that used to be a ring stack
+with the assistant's name in the middle.
+
+Design notes
+------------
+* **The face is real human geometry.** `core.avatar_mesh` builds the head around
+  MediaPipe's canonical face model, so eyelids, nostrils, lips and cheekbones
+  are measured anatomy rather than fitted curves. This renderer's whole job is
+  to light it, pose it and animate it.
+* **Software rendered, on purpose.** Everything is QPainter, so there is no
+  OpenGL context, no shader compile, no GPU driver to disagree with us and no
+  new pip dependency. It looks the same on a gaming rig, a 2013 laptop, a VM
+  and a remote desktop session.
+* **Lip-sync comes from the audio pipeline, not from the avatar.** `main.py`
+  already computes a real RMS level off the PCM (`_pcm_level`) for both the mic
+  and JARVIS's own output. The avatar just consumes that number, so there is no
+  second audio path to fall out of sync. The mouth only tracks the level while
+  JARVIS is *speaking* — during listening the same level drives the aura, so the
+  head never lip-syncs to the user's voice.
+
+The renderer is theme-agnostic: `paint()` takes its colours as arguments, which
+is what lets the HueWheel accent picker retint the avatar for free.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+
+import numpy as np
+from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt
+from PyQt6.QtGui import (
+    QBrush, QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
+    QPolygonF, QRadialGradient,
+)
+
+from core.avatar_mesh import JAW_MAX, JAW_PIVOT, get_head_mesh
+
+# Perspective camera distance in head-half-heights. Large enough that the nose
+# does not balloon, small enough to keep a sense of depth.
+_CAM_D = 4.6
+
+# Wireframe opacity buckets, so the whole lattice draws in a handful of batched
+# drawLines() calls instead of one call per line.
+_BUCKETS = 4
+_MIN_ALPHA = 0.05
+
+# Resolution of the surface-shading colour ramp. Banding across a filled facet
+# is far more visible than banding in line alpha, so this is fine-grained — and
+# being a lookup it costs nothing per face.
+_LUT_N = 192
+
+# The skin is rendered into an offscreen layer at this fraction of the HUD's
+# size and then smoothly upscaled. Every element of the skin is now a broad
+# gradient, so it survives the resample untouched, while the eyes, mouth, brows
+# and wire stay full-resolution on top. Fill cost drops with the square of the
+# scale; the cap keeps a fullscreen head from paying for detail no one can see.
+_SURF_SCALE = 0.42
+_SURF_MAX = 520.0
+# Lighting rig: a strong key from the upper left shapes the brow, nose and
+# cheekbones; a weaker fill from the right keeps the shadow side from going
+# flat; the view vector is +z, so the half-vector for the specular sheen is the
+# key light normalised against the camera.
+_KEY = np.array([-0.42, 0.62, 0.66], dtype=np.float32)
+_FILL = np.array([0.55, 0.08, 0.83], dtype=np.float32)
+_HALF = _KEY + np.array([0.0, 0.0, 1.0], dtype=np.float32)
+_KEY /= np.linalg.norm(_KEY)
+_FILL /= np.linalg.norm(_FILL)
+_HALF /= np.linalg.norm(_HALF)
+
+# How far the brows travel at full lift, in head-half-heights. Derived, not
+# tuned: the brow-to-eye gap is 0.198 and a real raise covers about a third of
+# it, then the drawn landmarks only carry half the rig weight.
+_BROW_LIFT = 0.14
+
+# Mouth timing, as time constants in seconds rather than per-frame fractions.
+# A fixed per-frame lerp silently changes speed with the frame rate: the HUD
+# runs at 60 Hz here, throttles its paint to 30, and drops to 20 when idle, so
+# the same constant meant three different mouths. These do not.
+#
+# Shutting is the fastest of the three, and it is measured rather than chosen.
+# A short closure occupies a single 20 ms schedule frame, so the mouth has one
+# step to reach it: at 20 ms the jaw got a third of the way and the closure
+# vanished, at 12 ms it arrives, and going below that changes nothing because
+# the analysis window is then the limit, not the smoothing. Halving it doubled
+# the closures the mouth visibly makes across a test paragraph, 5 of 21 to 10,
+# with no loss of opening on the vowels. Only the return to rest, once talking
+# has actually stopped, is leisurely.
+_TAU_OPEN = 0.022     # jaw dropping toward a vowel
+_TAU_SHUT = 0.012     # lips closing on a consonant, mid-word
+_TAU_REST = 0.055     # settling back to rest after speech ends
+_TAU_SHAPE = 0.018    # viseme openness following the schedule
+
+# Only the microphone path needs a level floor: it has one coarse RMS and no way
+# to tell speech from room tone. JARVIS's own voice arrives as a per-20 ms
+# schedule whose silences are already silent, so it needs no floor and must not
+# have one — a floor there swallows the gaps between words.
+_MIC_FLOOR = 0.14
+
+# How far below this voice's own loud level counts as a closure: -20 dB, which
+# is what a stop consonant actually drops to. Expressed as a ratio so it holds
+# at any speaker volume.
+_CLOSE_FRAC = 0.10
+
+
+def _rate(dt: float, tau: float) -> float:
+    """Per-frame lerp factor for an exponential approach with time constant
+    `tau`. Frame-rate independent: the motion takes the same wall-clock time at
+    20, 30 or 60 fps, and a long frame catches up instead of stalling."""
+    return 1.0 - math.exp(-dt / tau)
+
+
+def _c(col: QColor, a: float) -> QColor:
+    """Copy of `col` at alpha `a` (0-255, clamped)."""
+    q = QColor(col)
+    q.setAlpha(int(max(0.0, min(255.0, a))))
+    return q
+
+
+def _blend(bg: QColor, col: QColor, a: float) -> QColor:
+    """`col` at alpha `a` pre-mixed onto `bg`, returned fully **opaque**.
+
+    Qt's raster engine has a fast path for opaque antialiased lines and a much
+    slower blended path for everything else — measured at 1.0 ms versus 2.9 ms
+    for the same 780 lines. The HUD paints a flat background behind the avatar,
+    so mixing the alpha in by hand is visually equivalent and three times cheaper.
+    """
+    f = max(0.0, min(1.0, a / 255.0))
+    return QColor(int(bg.red() + (col.red() - bg.red()) * f),
+                  int(bg.green() + (col.green() - bg.green()) * f),
+                  int(bg.blue() + (col.blue() - bg.blue()) * f))
+
+
+def _convex_hull(points: np.ndarray) -> np.ndarray:
+    """Indices of the 2D convex hull, used as the clip for skin lighting.
+
+    The projected hull tracks the head through yaw and nod closely enough for a
+    soft, low-alpha lighting overlay; it is never drawn itself, so a millimetre
+    of slack at the silhouette is invisible.
+    """
+    pts = np.asarray(points)
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+
+    def cross(o, a, b):
+        return ((pts[a, 0] - pts[o, 0]) * (pts[b, 1] - pts[o, 1])
+                - (pts[a, 1] - pts[o, 1]) * (pts[b, 0] - pts[o, 0]))
+
+    lower: list[int] = []
+    for i in order:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], i) <= 0:
+            lower.pop()
+        lower.append(int(i))
+    upper: list[int] = []
+    for i in order[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], i) <= 0:
+            upper.pop()
+        upper.append(int(i))
+    return np.asarray(lower[:-1] + upper[:-1], dtype=np.int32)
+
+
+class HoloAvatar:
+    """Animated holographic head. One instance per HUD canvas.
+
+    Lifecycle:
+        av = HoloAvatar()
+        av.step(dt, amp, speaking=..., muted=...)          # once per tick
+        av.paint(painter, cx, cy, r, primary, accent, bg)  # once per frame
+    """
+
+    # Look: True paints a lit, solid head with a wireframe over it; False is a
+    # see-through glass wireframe. Flip here, or per instance.
+    shaded = True
+
+    def __init__(self) -> None:
+        mesh = get_head_mesh()
+        self._v0 = mesh["verts"]
+        self._n0 = mesh["normals"]
+        self._jaw = mesh["jaw"]
+        self._brow_w = mesh["brow"]
+        self._lips_w = mesh["lips"]
+        self._lip_c = mesh["lip_centre"]
+        self._fade = mesh["fade"]
+        self._f = mesh["faces"]
+        self._fgroup = mesh["face_group"]
+        self._n_head = mesh["n_head"]
+        self._fa, self._fb, self._fc = (self._f[:, i] for i in range(3))
+        self._e0 = mesh["edges"][:, 0]
+        self._e1 = mesh["edges"][:, 1]
+        self._lm = mesh["landmarks"]
+        # The inner-lip ring runs lower-lip left→right, then upper-lip back.
+        # Splitting it lets the upper arc anchor a strip of teeth, which is what
+        # keeps an open mouth from reading as a hole punched in the face.
+        lips_in = mesh["landmarks"]["lips_in"]
+        self._lip_up = np.concatenate([lips_in[10:], lips_in[:1]])
+
+        # Crown (+1.0) down to the bottom of the neck, in head-half-heights.
+        # Callers size the head to the room they have with this.
+        self.SPAN = mesh["span"][0] - mesh["span"][1]
+
+        # ── skin material factors ───────────────────────────────────────────
+        # Per-triangle finish weights, built once from the rest pose. Indexing
+        # by triangle rather than by screen position means the cheek tint and
+        # the eye-socket shading follow the face through every yaw, nod and jaw
+        # articulation without touching the rig or the animation state.
+        _c = self._v0[self._f].mean(axis=1)
+        _lip_c = np.asarray(self._lip_c, dtype=np.float32)
+        self._cheekw = (np.exp(-((np.abs(_c[:, 0]) - 0.40) / 0.19) ** 2)
+                        * np.exp(-((_c[:, 1] + 0.24) / 0.21) ** 2)
+                        * np.clip(_c[:, 2] * 2.4, 0.0, 1.0))
+        self._lipw = (np.exp(-((_c[:, 1] - _lip_c[1]) / 0.085) ** 2)
+                      * np.exp(-(_c[:, 0] / 0.21) ** 2)
+                      * np.clip(_c[:, 2] * 2.6, 0.0, 1.0))
+        _eye_l = self._v0[self._lm["eye_l"]].mean(axis=0)
+        _eye_r = self._v0[self._lm["eye_r"]].mean(axis=0)
+        _de = np.minimum(np.linalg.norm(_c - _eye_l, axis=1),
+                         np.linalg.norm(_c - _eye_r, axis=1))
+        self._socket = np.exp(-(_de / 0.10) ** 2) * 0.20
+
+        # Outline used to clip the soft skin-light pass (see _paint_skin_light).
+        self._hull = _convex_hull(self._v0[:, :2])
+        self._hull_head = _convex_hull(self._v0[:self._n_head, :2])
+        self._hull_neck = _convex_hull(self._v0[self._n_head:, :2])
+        self._skin_light = None            # baked face-space lighting
+
+        self._lut_cache = None
+        self._lut_key = None
+        self._surf: QImage | None = None   # cached offscreen skin layer
+        self._sil_clip: QPainterPath | None = None
+
+        n = self._v0.shape[0]
+        self._v = np.empty((n, 3), dtype=np.float32)
+
+        self._t = 0.0
+        self._sway = 0.0           # integrated sway phase — see step()
+        self._yaw = 0.0
+        self._pitch = 0.0
+        self._mouth = 0.0          # 0..1 smoothed jaw opening
+        self._glow = 0.0           # 0..1 smoothed overall energy
+        self._scan = -1.6          # vertical position of the energy sweep
+        self._blink = 0.0          # 0 = open, 1 = shut
+        self._blink_at = 3.0
+
+        # ── expression ──────────────────────────────────────────────────────
+        # Speech is not just a moving jaw. Brows ride the loudness envelope,
+        # eyes widen with the brows, and the gaze flicks between fixation
+        # points — those three are what make it read as talking rather than as
+        # a puppet chewing.
+        self._amp_slow = 0.0
+        self._expr = 0.0
+        self._expr_tgt = 0.0
+        self._expr_at = 0.0
+        self._brow = 0.0           # smoothed brow lift, -0.4 .. 1.2
+        self._emph = 0.0           # syllable emphasis, drives the head nod
+        self._gaze = [0.0, 0.0]
+        self._gaze_tgt = [0.0, 0.0]
+        self._gaze_at = 0.0
+
+        # ── state expression ────────────────────────────────────────────────
+        # The face is the fastest status indicator in the app: you read a gaze
+        # before you read a word. Saccades orbit a bias that the assistant's
+        # state moves — eyes off to the side while it thinks, back on you while
+        # it listens, lids low while it sleeps.
+        self._gaze_bias = [0.0, 0.0]
+        self._bias_tgt = [0.0, 0.0]
+        self._bias_at = 0.0
+        self._lids = 1.0           # 1 = wide, 0 = shut; low while asleep
+        self._brow_bias = 0.0      # concentration pulls the brows down
+        self._glance = None        # (dx, dy, until_t) — a deliberate look
+
+        # ── viseme ──────────────────────────────────────────────────────────
+        # Loudness alone only answers "how far open", which is why an RMS-driven
+        # mouth flaps rather than speaks. These two carry the *shape*: how open
+        # the jaw is for this sound, and whether the lips are spread (/i/) or
+        # rounded (/u/). They come from a formant read of the audio actually
+        # being played — see `_pcm_visemes` in main.py.
+        self._v_open = 1.0
+        self._v_wide = 0.0
+        self._wide = 0.0           # smoothed lip spread, -1 round .. +1 spread
+        self._v_peak = 0.18        # running estimate of this voice's loud level
+
+    # ── animation ───────────────────────────────────────────────────────────
+
+    def _mouth_step(self, dt: float, amp: float, live: bool,
+                    v_open: float | None, v_level: float | None) -> None:
+        """One increment of the jaw. Called once per viseme frame while JARVIS
+        speaks, once per rendered frame otherwise."""
+        if v_open is None:
+            shape = 1.0
+        else:
+            self._v_open += (v_open - self._v_open) * _rate(dt, _TAU_SHAPE)
+            shape = self._v_open
+
+        if v_level is None:
+            gated = max(0.0, (amp - _MIC_FLOOR) / (1.0 - _MIC_FLOOR))
+            drive = (gated ** 0.6) * (shape ** 0.75)
+        else:
+            # Speech RMS spends most of its time well below full scale, so the
+            # raw value alone would only ever half-open the jaw. Normalise it
+            # against a running estimate of this voice's own loud level rather
+            # than a constant: it then reads the same whether the user has the
+            # volume low or the model happens to be speaking softly.
+            self._v_peak = max(v_level, self._v_peak - dt * 0.55)
+            ref = max(0.18, self._v_peak)
+            # The floor is a fraction of this voice's own loud level, not a
+            # fixed number, so it means the same thing at any volume and in any
+            # language. A stop consonant drops 20 dB or more below the vowels
+            # around it, which is this ratio — so a real closure lands at
+            # exactly zero rather than at some small positive value the curve
+            # would otherwise lift back up. That lift is what kept the mouth
+            # from ever quite shutting between words.
+            q = (v_level - _CLOSE_FRAC * ref) / (ref * (1.0 - _CLOSE_FRAC))
+            drive = max(0.0, min(1.0, q)) ** 0.85 * (shape ** 0.75)
+
+        target = min(1.0, drive) if live else 0.0
+        if target > self._mouth:
+            tau = _TAU_OPEN
+        elif live:
+            tau = _TAU_SHUT      # mid-word: a consonant, and it must shut now
+        else:
+            tau = _TAU_REST      # speech is over; settle, don't snap
+        self._mouth += (target - self._mouth) * _rate(dt, tau)
+        if self._mouth < 0.002:
+            self._mouth = 0.0
+
+    def step(self, dt: float, amp: float, speaking: bool = False,
+             muted: bool = False, state: str = "",
+             v_open: float | None = None, v_wide: float = 0.0,
+             v_level: float | None = None,
+             v_seq: list | None = None, v_hop: float = 0.02) -> None:
+        """Advance the animation.
+
+        `amp` is the 0..1 display audio level. `v_open` / `v_wide` / `v_level`
+        are the viseme schedule's shape and true level for this instant; passing
+        None falls back to loudness-only articulation, which is what the
+        microphone path uses. `v_seq` is every schedule frame the last rendered
+        frame spanned, so no closure is lost when the paint rate drops.
+        """
+        dt = max(0.001, min(0.10, float(dt)))
+        self._t += dt
+        t = self._t
+        amp = max(0.0, min(1.0, float(amp)))
+        live = speaking and not muted
+
+        # Idle sway. The phase is *integrated* rather than taken as
+        # sin(t * rate * speed): multiplying absolute time by a speed that
+        # changes when JARVIS starts or stops talking jumps the phase by
+        # t * rate * delta, which after a minute of uptime is several radians
+        # and visibly teleports the head the instant a sentence ends.
+        speed = (1.0 if not muted else 0.55) * (1.25 if live else 1.0)
+        self._sway += dt * speed
+        s = self._sway
+        self._yaw = 0.26 * math.sin(s * 0.31) + 0.09 * math.sin(s * 0.73 + 1.3)
+        self._pitch = (0.060 * math.sin(s * 0.23 + 0.7)
+                       + 0.024 * math.sin(s * 0.61))
+
+        # Mouth. Which level is driving it matters more than any rate here.
+        #
+        # `v_level` is this 20 ms frame's own RMS, taken from the very audio
+        # about to be heard, so its silences are real silences. `amp` is the
+        # waveform display's level, and that one is a *peak hold*: it keeps the
+        # loudest value it has seen and decays gently, on purpose, so the bars
+        # do not stutter between audio chunks. Driving a mouth from a peak hold
+        # is why the gaps between words never closed — the hold spans exactly
+        # the consonant it was supposed to reveal. So the schedule drives the
+        # jaw whenever there is one, and `amp` is left to the microphone path,
+        # which has nothing better.
+        # Advance the mouth once per *schedule* frame rather than once per
+        # rendered frame. A bilabial closure lasts around 40 ms — two frames of
+        # a 50 Hz schedule — and the HUD throttles its paint to 30 fps and to 20
+        # when idle. Point-sampling at 20 fps steps 50 ms at a time, so a whole
+        # closure can fall between two samples and simply never be seen; that is
+        # information loss no smoothing constant can recover. Sub-stepping costs
+        # a few float operations per frame and makes the mouth identical at 20,
+        # 30 and 60 fps.
+        # An empty list is meaningful and is not the same as None: it says a
+        # schedule is playing but this tick landed inside a frame already
+        # spoken. The mouth's clock is the schedule's, so the right thing then
+        # is to do nothing. Re-stepping the same frame — which is what a
+        # truthiness test here would do — advances the jaw twice for one 20 ms
+        # of audio, and at 60 fps that alone made the mouth behave differently
+        # than at 20.
+        if v_seq is not None:
+            for lv, op, _wd in v_seq:
+                self._mouth_step(v_hop, amp, live, op, lv)
+        else:
+            self._mouth_step(dt, amp, live, v_open, v_level)
+
+        # Syllable emphasis. Applied unconditionally: `_emph` decays to zero on
+        # its own once the mouth closes, whereas gating it on `live` deleted the
+        # whole offset in a single frame and snapped the head at sentence end.
+        self._emph += (self._mouth - self._emph) * _rate(
+            dt, 0.055 if self._mouth > self._emph else 0.32)
+        self._pitch -= self._emph * 0.028
+        self._yaw += 0.018 * math.sin(t * 1.7) * self._emph
+
+        # Loudness envelope, deliberately lazier than the mouth: brows track the
+        # shape of a phrase, not individual syllables.
+        env = amp if live else 0.0
+        self._amp_slow += (env - self._amp_slow) * _rate(
+            dt, 0.16 if env > self._amp_slow else 0.36)
+
+        if live:
+            if t >= self._expr_at:
+                self._expr_tgt = random.uniform(-0.35, 1.0)
+                self._expr_at = t + 1.1 + 2.0 * random.random()
+        else:
+            self._expr_tgt = 0.0
+            self._expr_at = t + 0.8
+        self._expr += (self._expr_tgt - self._expr) * 0.075
+
+        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias
+        self._brow += (max(-0.4, min(1.2, brow_t)) - self._brow) * 0.20
+
+        # ── what the state does to the face ─────────────────────────────────
+        st = (state or "").upper()
+        thinking = st in ("THINKING", "PROCESSING")
+        asleep = st in ("SLEEPING", "STANDBY", "OFFLINE")
+
+        if thinking:
+            # People look away to think, and hold it. The direction re-rolls
+            # slowly so it reads as thought rather than as scanning.
+            if t >= self._bias_at:
+                self._bias_tgt = [random.choice((-1.0, 1.0)) * random.uniform(0.45, 0.8),
+                                  random.uniform(0.25, 0.55)]
+                self._bias_at = t + 1.4 + 1.6 * random.random()
+            brow_bias, lid_tgt = -0.28, 0.94
+        elif asleep:
+            self._bias_tgt = [0.0, -0.25]
+            brow_bias, lid_tgt = -0.05, 0.22
+        else:
+            # LISTENING / idle / speaking: eyes come back to the user.
+            self._bias_tgt = [0.0, 0.0]
+            self._bias_at = 0.0
+            brow_bias = 0.10 if st == "LISTENING" else 0.0
+            lid_tgt = 1.0
+
+        for i in (0, 1):
+            self._gaze_bias[i] += (self._bias_tgt[i] - self._gaze_bias[i]) * 0.06
+        self._lids += (lid_tgt - self._lids) * 0.08
+        self._brow_bias += (brow_bias - self._brow_bias) * 0.06
+
+        # Gaze: saccades are near-instant jumps between fixations, and they get
+        # more frequent when there is something to say. While thinking they slow
+        # right down — a darting eye reads as nervous, not thoughtful.
+        if t >= self._gaze_at:
+            reach = 0.9 if live else (0.35 if thinking else 0.55)
+            self._gaze_tgt = [random.uniform(-1.0, 1.0) * reach,
+                              random.uniform(-1.0, 1.0) * reach * 0.55]
+            if live:
+                self._gaze_at = t + 0.55 + 1.7 * random.random()
+            elif thinking:
+                self._gaze_at = t + 1.8 + 2.4 * random.random()
+            else:
+                self._gaze_at = t + 1.3 + 2.8 * random.random()
+
+        # A deliberate glance (something appeared on screen) overrides the
+        # wandering for a moment, then hands control back.
+        if self._glance is not None:
+            gx, gy, until = self._glance
+            if t < until:
+                self._gaze_tgt = [gx, gy]
+            else:
+                self._glance = None
+
+        for i, b in enumerate(self._gaze_bias):
+            tgt = max(-1.0, min(1.0, self._gaze_tgt[i] + b))
+            self._gaze[i] += (tgt - self._gaze[i]) * 0.30
+
+        # Lips lead the jaw slightly in real speech, so they track a touch
+        # faster; they also relax to neutral the moment the voice stops.
+        wide_t = v_wide if (live and v_open is not None) else 0.0
+        self._wide += (max(-1.0, min(1.0, wide_t)) - self._wide) * _rate(dt, 0.030)
+
+        self._glow += ((0.0 if muted else amp) - self._glow) * (
+            0.35 if (0.0 if muted else amp) > self._glow else 0.10)
+
+        self._scan += dt * (0.55 + 1.5 * self._glow)
+        if self._scan > 1.35:
+            self._scan = -1.75
+
+        if self._blink > 0.0:
+            self._blink = max(0.0, self._blink - dt * 8.5)
+        elif t >= self._blink_at:
+            # Concentration suppresses blinking; a sleeping face has no need of
+            # it at all, since the lids are already down.
+            if asleep:
+                self._blink_at = t + 6.0
+            else:
+                self._blink = 1.0
+                gap = 5.5 if thinking else 3.4
+                self._blink_at = t + gap + 3.1 * random.random()
+
+    def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
+        """Look deliberately somewhere for `hold` seconds, then wander again.
+
+        Used when something appears on screen: a face that looks at what just
+        showed up tells the user it landed, without a word being spoken.
+        """
+        self._glance = (max(-1.0, min(1.0, float(dx))),
+                        max(-1.0, min(1.0, float(dy))),
+                        self._t + max(0.1, float(hold)))
+
+    # ── posing ──────────────────────────────────────────────────────────────
+
+    def _pose(self):
+        """Jaw drop, brow lift and head rotation, applied to the real geometry."""
+        v = self._v
+        np.copyto(v, self._v0)
+
+        if self._brow > 0.004 or self._brow < -0.004:
+            # The brow-to-eye gap is 0.198 head-half-heights and a real raise
+            # moves a third of it. The old 0.045 — halved again by the landmark
+            # weights, which average 0.5 — worked out to six pixels on a 250 px
+            # head, which is to say invisible.
+            v[:, 1] += self._brow_w * (self._brow * _BROW_LIFT)
+
+        if abs(self._wide) > 0.01 and self._mouth > 0.0:
+            # Spread pulls the corners out and flattens the lips back; rounding
+            # draws them in and pushes them forward into a purse.
+            k = self._lips_w * (self._wide * self._mouth)
+            v[:, 0] += k * (v[:, 0] - self._lip_c[0]) * 0.55
+            v[:, 1] += k * (v[:, 1] - self._lip_c[1]) * 0.30
+            v[:, 2] -= k * 0.055
+
+        if self._mouth > 0.004:
+            px, py, pz = JAW_PIVOT
+            ang = self._jaw * (self._mouth * JAW_MAX)
+            ca, sa = np.cos(ang), np.sin(ang)
+            dy = v[:, 1] - py
+            dz = v[:, 2] - pz
+            v[:, 1] = py + dy * ca - dz * sa
+            v[:, 2] = pz + dy * sa + dz * ca
+
+        cy, sy = math.cos(self._yaw), math.sin(self._yaw)
+        cp, sp = math.cos(self._pitch), math.sin(self._pitch)
+        m = np.array([
+            [cy, 0.0, sy],
+            [sp * sy, cp, -sp * cy],
+            [-cp * sy, sp, cp * cy],
+        ], dtype=np.float32)
+
+        return v @ m.T, self._n0 @ m.T
+
+    # ── rendering ───────────────────────────────────────────────────────────
+
+    def _luts(self, bg: QColor, primary: QColor, accent: QColor):
+        """Cached ramps for the four skin finishes.
+
+        One ramp per finish, all indexed by the same brightness value: ordinary
+        skin, a faint rose-violet cheek blush, a muted lip tone and the violet
+        rim at grazing angles. Selecting a ramp per triangle changes the
+        material without adding a single draw call.
+        """
+        key = (bg.rgb(), primary.rgb(), accent.rgb())
+        if self._lut_key == key and self._lut_cache is not None:
+            return self._lut_cache
+
+        def mix(a: QColor, b: QColor, t: float) -> QColor:
+            t = max(0.0, min(1.0, t))
+            return QColor(int(a.red() + (b.red() - a.red()) * t),
+                          int(a.green() + (b.green() - a.green()) * t),
+                          int(a.blue() + (b.blue() - a.blue()) * t))
+
+        # Blue-cyan android skin: near-black teal in the shadow, a desaturated
+        # midtone, then a pale porcelain highlight. Keeping the midtone
+        # desaturated is what stops the whole head reading as one flat neon
+        # surface; the saturation returns only at the lit crown and the rim.
+        stops = [
+            _blend(bg, QColor(4, 20, 30), 255),
+            mix(primary, QColor(10, 44, 58), 0.78),
+            mix(primary, QColor(54, 128, 146), 0.58),
+            mix(primary, QColor(152, 210, 222), 0.55),
+            QColor(206, 239, 245),
+        ]
+
+        def ramp(tint: QColor | None = None, amount: float = 0.0):
+            out = []
+            for i in range(_LUT_N):
+                t = (i + 0.5) / _LUT_N
+                seg = t * (len(stops) - 1)
+                j = min(int(seg), len(stops) - 2)
+                f = seg - j
+                col = mix(stops[j], stops[j + 1], f)
+                if tint is not None and amount:
+                    # Tint the lit part more than the shadow, the way pigment
+                    # under skin behaves, so depth does not wash out.
+                    col = mix(col, tint, amount * (0.35 + 0.65 * t))
+                out.append(QBrush(col))
+            return out
+
+        self._lut_cache = (
+            ramp(),
+            ramp(QColor(142, 108, 255), 0.30),      # rim light
+            ramp(QColor(186, 96, 140), 0.26),       # lips
+        )
+        self._lut_key = key
+        return self._lut_cache
+
+    def paint(self, p: QPainter, cx: float, cy: float, r: float,
+              primary: QColor, accent: QColor, bg: QColor | None = None) -> None:
+        """Draw the avatar with its head centre at (cx, cy).
+
+        `r` is the head's half-height in pixels — the caller owns the layout, so
+        the HUD can fit the head to whatever room the status line leaves it.
+        """
+        if bg is None:
+            bg = QColor(0, 0, 0)
+        amp = self._glow
+        verts, norms = self._pose()
+
+        # ── aura ────────────────────────────────────────────────────────────
+        ar = r * 1.95
+        grad = QRadialGradient(cx, cy, ar)
+        grad.setColorAt(0.00, _c(primary, 34 + 66 * amp))
+        grad.setColorAt(0.38, _c(primary, 20 + 40 * amp))
+        grad.setColorAt(1.00, _c(primary, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawEllipse(QRectF(cx - ar, cy - ar, ar * 2, ar * 2))
+
+        # ── project ─────────────────────────────────────────────────────────
+        w = _CAM_D - verts[:, 2]
+        np.maximum(w, 0.35, out=w)
+        k = (_CAM_D / w) * r
+        xs = cx + verts[:, 0] * k
+        ys = cy - verts[:, 1] * k
+
+        if self.shaded:
+            self._paint_skin_layer(p, cx, cy, r, xs, ys, norms, verts,
+                                   primary, accent, bg, amp)
+        self._paint_wire(p, xs, ys, norms, verts, primary, bg, amp)
+        self._paint_features(p, xs, ys, norms, r, primary, accent, bg, amp)
+
+    def _paint_skin_layer(self, p: QPainter, cx: float, cy: float, r: float,
+                          xs, ys, norms, verts, primary: QColor,
+                          accent: QColor, bg: QColor, amp: float) -> None:
+        """Render the lit skin offscreen, then upscale it smoothly.
+
+        The skin is broad gradients, not detail, so it does not need pixel
+        resolution: the features, brows and wire are drawn afterwards at full
+        resolution on top, and the facet fills read as soft material once they
+        are resampled instead of as flat patches. Two wins at once — the fill
+        cost drops with the square of the scale, and the upscale does the
+        smoothing that hundreds of extra triangles would otherwise have to.
+        """
+        dpr = 1.0
+        try:
+            dpr = max(1.0, float(p.device().devicePixelRatioF()))
+        except Exception:
+            pass
+        s = _SURF_SCALE * dpr
+
+        pad_x = 1.14 * r
+        pad_top = 1.14 * r
+        pad_bot = 1.62 * r
+        s = min(_SURF_SCALE * dpr,
+                _SURF_MAX / max(pad_x * 2.0, pad_top + pad_bot))
+        iw = max(8, int(math.ceil(pad_x * 2.0 * s)))
+        ih = max(8, int(math.ceil((pad_top + pad_bot) * s)))
+        if self._surf is None or self._surf.width() != iw or self._surf.height() != ih:
+            self._surf = QImage(iw, ih, QImage.Format.Format_ARGB32_Premultiplied)
+        self._surf.fill(Qt.GlobalColor.transparent)
+
+        sp = QPainter(self._surf)
+        sp.scale(s, s)
+        sp.translate(-(cx - pad_x), -(cy - pad_top))
+        self._paint_surface(sp, xs, ys, norms, verts, primary, accent, bg, amp)
+        self._paint_skin_light(sp, xs, ys, primary, bg, self._sil_clip)
+        sp.end()
+
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawImage(
+            QRectF(cx - pad_x, cy - pad_top, iw / s, ih / s),
+            self._surf, QRectF(0.0, 0.0, float(iw), float(ih)))
+        p.restore()
+
+    def _paint_surface(self, p: QPainter, xs, ys, norms, verts,
+                       primary: QColor, accent: QColor, bg: QColor,
+                       amp: float) -> None:
+        """Fill the projected silhouette with the skin's base tone.
+
+        Shading one triangle at a time is exactly what made the head read as a
+        low-poly mask: a facet carries a single colour, so smoothing the normals
+        moved the steps around but could not remove them, and aliased fills left
+        a hairline mesh between neighbouring facets. Here the base tone is *one*
+        gradient inside the projected outline — no seams and no facets — and the
+        soft light pass that follows sculpts the anatomy.
+
+        The outline is the convex hull of each part rather than the union of a
+        thousand triangle edges. A head and a neck tube are both convex enough
+        that the hull is the silhouette to within a pixel, and filling one
+        simple polygon with antialiasing on is both smooth and cheap. The hull
+        *indices* are computed once from the rest pose and only projected per
+        frame — recomputing a 1400-point hull in Python took 15 ms, more than
+        everything else in the frame.
+        """
+        n_head = self._n_head
+        hi = self._hull_head
+        ni = self._hull_neck
+        if hi.size < 3 or ni.size < 3:
+            return
+
+        head_path = QPainterPath()
+        head_path.setFillRule(Qt.FillRule.WindingFill)
+        head_path.addPolygon(QPolygonF(
+            [QPointF(float(xs[i]), float(ys[i])) for i in hi]))
+        neck_path = QPainterPath()
+        neck_path.setFillRule(Qt.FillRule.WindingFill)
+        neck_path.addPolygon(QPolygonF(
+            [QPointF(float(xs[i + n_head]), float(ys[i + n_head])) for i in ni]))
+
+        luts = self._luts(bg, primary, accent)
+        skin = luts[0]
+
+        def shade(i):
+            return skin[min(_LUT_N - 1, max(0, i))].color()
+
+        hb = head_path.boundingRect()
+        # A radial key from the upper left reads as a lit volume in one fill;
+        # a linear ramp across the face only changes brightness top to bottom
+        # and leaves the cheeks as flat as a painted mask.
+        g = QRadialGradient(hb.center().x() - hb.width() * 0.22,
+                            hb.top() + hb.height() * 0.27,
+                            max(hb.width(), hb.height() * 0.80))
+        g.setColorAt(0.00, shade(152))
+        g.setColorAt(0.45, shade(112))
+        g.setColorAt(0.75, shade(76))
+        g.setColorAt(1.00, shade(40))
+
+        nb = neck_path.boundingRect()
+        ng = QLinearGradient(nb.left(), nb.top(), nb.left(), nb.bottom())
+        ng.setColorAt(0.0, shade(84))
+        ng.setColorAt(0.45, shade(42))
+        ng.setColorAt(1.0, shade(4))
+
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(ng))
+        p.drawPath(neck_path)          # behind the jaw
+        p.setBrush(QBrush(g))
+        p.drawPath(head_path)
+
+        self._sil_clip = QPainterPath(head_path)
+        self._sil_clip.addPath(neck_path)
+
+    def _build_skin_light(self) -> QImage:
+        """Bake the face's soft light and shadow once, in head-local space.
+
+        These are twenty-odd broad gradients — forehead and cheek sheen, the
+        nose ridge and its cast shadow, brow ridge, cheekbones, jaw, rim lights.
+        Rendered live they cost more than everything else in the frame put
+        together, and they are *static*: the same light falls on the same face
+        whatever the animation is doing. Baked once into a face-space image,
+        the whole pass is a single smooth blit, and the shading can be as rich
+        as it needs to be without a per-frame price.
+
+        Anchors are the landmark rings of the rest pose, normalised to the
+        head's own bounding box, which is also the box the runtime maps back
+        onto the posed head. The animation rig is untouched either way.
+        """
+        n = self._n_head
+        pts = self._v0[:n]
+        x0 = float(pts[:, 0].min())
+        x1 = float(pts[:, 0].max())
+        y0 = float(pts[:, 1].min())
+        y1 = float(pts[:, 1].max())
+        W = 512
+        H = max(8, int(round(W * (y1 - y0) / max(1e-6, x1 - x0))))
+        img = QImage(W, H, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        def X(x):
+            return (float(x) - x0) / (x1 - x0) * W
+
+        def Y(y):
+            return (y1 - float(y)) / (y1 - y0) * H
+
+        lm = self._lm
+        el, er = lm["eye_l"], lm["eye_r"]
+        egx = (X(pts[el, 0].mean()) + X(pts[er, 0].mean())) * 0.5
+        egy = (Y(pts[el, 1].mean()) + Y(pts[er, 1].mean())) * 0.5
+        lmy = Y(pts[lm["lips_out"], 1].mean())
+        top, chin = Y(y1), Y(y0)
+        left, right = 0.0, float(W)
+        w = float(W)
+        fh = max(1.0, chin - top)
+        eye_to_chin = max(1.0, chin - egy)
+
+        def glow(cx, cy, rx, ry, col: QColor, a0: float) -> None:
+            g = QRadialGradient(cx, cy, max(rx, ry))
+            g.setColorAt(0.0, _c(col, a0))
+            g.setColorAt(0.55, _c(col, a0 * 0.34))
+            g.setColorAt(1.0, _c(col, 0.0))
+            p.setBrush(QBrush(g))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QRectF(cx - rx, cy - ry, rx * 2.0, ry * 2.0))
+
+        shade = QColor(0, 8, 16)
+        sheen = QColor(206, 250, 255)
+
+        p.save()
+        hx = [X(pts[i, 0]) for i in self._hull_head]
+        hy = [Y(pts[i, 1]) for i in self._hull_head]
+        clip = QPainterPath()
+        clip.addPolygon(QPolygonF(
+            [QPointF(float(a), float(b)) for a, b in zip(hx, hy)]))
+        p.setClipPath(clip)
+
+        # Ambient shadow: down the viewer's right and under the jaw. This is
+        # the pair that makes the head read as volume. A symmetric pair of
+        # temple shadows was tried too and removed: on a face this smooth they
+        # met across the bridge of the nose and drew two long grooves down it.
+        glow(egx + w * 0.32, egy + eye_to_chin * 0.42,
+             w * 0.32, eye_to_chin * 0.62, shade, 82)
+        glow(egx, chin - eye_to_chin * 0.06,
+             w * 0.38, eye_to_chin * 0.22, shade, 60)
+
+        # Key light: forehead, left cheek, a narrow nose ridge and the chin.
+        glow(egx - w * 0.04, top + fh * 0.17,
+             w * 0.34, fh * 0.24, sheen, 46)
+        glow(egx - w * 0.20, egy + eye_to_chin * 0.36,
+             w * 0.20, eye_to_chin * 0.30, sheen, 48)
+        glow(egx + w * 0.18, egy + eye_to_chin * 0.40,
+             w * 0.16, eye_to_chin * 0.26, sheen, 32)
+        glow(egx - w * 0.004, egy + eye_to_chin * 0.14,
+             w * 0.020, eye_to_chin * 0.20, QColor(240, 255, 255), 46)
+        glow(egx, chin - eye_to_chin * 0.12,
+             w * 0.13, eye_to_chin * 0.11, sheen, 26)
+
+        # Rim light on the shadow-free edge, and the shadow under the lower
+        # lip that gives the chin its own plane.
+        glow(left + w * 0.020, egy + eye_to_chin * 0.16,
+             w * 0.070, eye_to_chin * 0.44, sheen, 38)
+        glow(egx, lmy + eye_to_chin * 0.10,
+             w * 0.10, eye_to_chin * 0.05, shade, 30)
+
+        # ── anatomy ─────────────────────────────────────────────────────────
+        # The nose is the one feature the silhouette cannot describe from the
+        # front, so it is built from a ridge highlight with a shadow down each
+        # side and a glint at the tip. The shadow side is nearly twice as dark:
+        # a symmetric pair of side shadows reads as two grooves (it did).
+        nose_top = egy + eye_to_chin * 0.10
+        nose_bot = egy + eye_to_chin * 0.48
+        ny = (nose_top + nose_bot) * 0.5
+        nh = (nose_bot - nose_top) * 0.42
+        glow(egx - w * 0.004, nose_top + nh * 0.8,
+             w * 0.020, nh * 0.55, QColor(240, 255, 255), 40)
+        glow(egx + w * 0.002, ny, w * 0.022, nh * 0.62,
+             QColor(242, 255, 255), 58)
+        glow(egx, nose_bot - eye_to_chin * 0.055,
+             w * 0.040, eye_to_chin * 0.055, QColor(246, 255, 255), 78)
+        glow(egx - w * 0.044, nose_bot - eye_to_chin * 0.035,
+             w * 0.018, eye_to_chin * 0.030, sheen, 34)
+        glow(egx + w * 0.044, nose_bot - eye_to_chin * 0.035,
+             w * 0.016, eye_to_chin * 0.028, sheen, 24)
+        glow(egx - w * 0.040, ny, w * 0.032, nh * 0.95, shade, 34)
+        glow(egx + w * 0.040, ny, w * 0.032, nh * 1.05, shade, 50)
+        glow(egx, nose_bot + eye_to_chin * 0.012,
+             w * 0.058, eye_to_chin * 0.032, shade, 74)
+        glow(egx - w * 0.026, nose_bot - eye_to_chin * 0.004,
+             w * 0.012, eye_to_chin * 0.020, shade, 52)
+        glow(egx + w * 0.026, nose_bot - eye_to_chin * 0.004,
+             w * 0.012, eye_to_chin * 0.020, shade, 52)
+
+        # Eye sockets: a soft shade over the upper orbit makes the eyes sit
+        # *in* the head instead of on it. Anchored to the real eye rings so it
+        # tracks the animation. Kept broad and faint — a tighter, darker one
+        # reads as a pair of hollow rectangles.
+        exl = X(pts[el, 0].mean())
+        exr = X(pts[er, 0].mean())
+        eyl = Y(pts[el, 1].mean())
+        eyr = Y(pts[er, 1].mean())
+        ey = (eyl + eyr) * 0.5
+        for ex in (exl, exr):
+            glow(ex, ey - eye_to_chin * 0.045,
+                 w * 0.125, eye_to_chin * 0.070, shade, 34)
+        glow(exl - w * 0.075, ey + eye_to_chin * 0.02,
+             w * 0.06, eye_to_chin * 0.07, shade, 16)
+        glow(exr + w * 0.075, ey + eye_to_chin * 0.02,
+             w * 0.06, eye_to_chin * 0.07, shade, 22)
+
+        # Brow ridge, cheekbones and the plane under them.
+        glow(egx - w * 0.16, egy - eye_to_chin * 0.30,
+             w * 0.15, eye_to_chin * 0.07, sheen, 26)
+        glow(egx + w * 0.16, egy - eye_to_chin * 0.30,
+             w * 0.14, eye_to_chin * 0.07, sheen, 14)
+        glow(exl - w * 0.01, ey + eye_to_chin * 0.19,
+             w * 0.19, eye_to_chin * 0.14, sheen, 24)
+        glow(exr + w * 0.01, ey + eye_to_chin * 0.19,
+             w * 0.17, eye_to_chin * 0.13, sheen, 16)
+        glow(exl, ey + eye_to_chin * 0.42,
+             w * 0.20, eye_to_chin * 0.14, shade, 20)
+        glow(exr, ey + eye_to_chin * 0.42,
+             w * 0.19, eye_to_chin * 0.14, shade, 28)
+
+        # Jaw: shade the sides so the chin has a plane of its own.
+        glow(left + w * 0.14, chin - eye_to_chin * 0.22,
+             w * 0.13, eye_to_chin * 0.12, shade, 36)
+        glow(right - w * 0.14, chin - eye_to_chin * 0.22,
+             w * 0.13, eye_to_chin * 0.12, shade, 48)
+        glow(right - w * 0.05, chin - eye_to_chin * 0.02,
+             w * 0.13, eye_to_chin * 0.11, shade, 22)
+
+        # A whisper of warmth on the cheekbones. Blue android skin reads as a
+        # mask without it; a few percent of rose puts blood back under it
+        # without turning the face human-warm.
+        blush = QColor(224, 148, 190)
+        glow(egx - w * 0.25, egy + eye_to_chin * 0.40,
+             w * 0.15, eye_to_chin * 0.17, blush, 16)
+        glow(egx + w * 0.25, egy + eye_to_chin * 0.40,
+             w * 0.15, eye_to_chin * 0.17, blush, 14)
+
+        # Violet rim at both edges — the android tell, kept faint enough that
+        # it never competes with the eyes.
+        rim = QColor(150, 110, 255)
+        glow(left + w * 0.015, egy + eye_to_chin * 0.22,
+             w * 0.10, eye_to_chin * 0.66, rim, 28)
+        glow(right - w * 0.015, egy + eye_to_chin * 0.22,
+             w * 0.10, eye_to_chin * 0.66, rim, 22)
+
+        p.restore()
+        p.end()
+        return img
+
+    def _paint_skin_light(self, p: QPainter, xs, ys,
+                          primary: QColor, bg: QColor,
+                          clip: QPainterPath | None = None) -> None:
+        """Blit the baked face lighting onto the head at its posed position.
+
+        The image is head-local; mapping its bounding box onto the posed head's
+        bounding box carries it through yaw, nod and the idle sway. Clipping to
+        the live silhouette keeps the edges exact where the projection narrows.
+        Eyes, mouth, brows and wire are drawn afterwards, full-resolution.
+        """
+        if clip is None:
+            return
+        if self._skin_light is None:
+            self._skin_light = self._build_skin_light()
+        n = self._n_head
+        x0 = float(xs[:n].min())
+        x1 = float(xs[:n].max())
+        y0 = float(ys[:n].min())
+        y1 = float(ys[:n].max())
+        if x1 - x0 < 2.0 or y1 - y0 < 2.0:
+            return
+
+        p.save()
+        p.setClipPath(clip)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawImage(QRectF(x0, y0, x1 - x0, y1 - y0), self._skin_light)
+        p.restore()
+
+    def _paint_wire(self, p: QPainter, xs, ys, norms, verts,
+                    primary: QColor, bg: QColor, amp: float) -> None:
+        nz = norms[:, 2]
+        fres = np.abs(1.0 - np.abs(nz)) ** 1.5
+        if self.shaded:
+            # The lit skin underneath is the surface now; the lattice is only
+            # a suggestion of structure. It used to draw at full strength,
+            # which made the head read as an exposed polygon wireframe rather
+            # than as an android with skin — so this is a whisper of topology,
+            # plus the scan sweep that keeps the holographic identity.
+            front = nz > -0.05
+            va = np.where(front, 0.004 + 0.019 * fres, 0.0)
+            # The sweep stays a shimmer, not a lattice: on smooth skin the old
+            # 0.11 peak lit the sparse eye-socket edges into a broken-glass
+            # scribble across the face.
+            va += 0.035 * np.exp(-((verts[:, 1] - self._scan) / 0.16) ** 2) * front
+        else:
+            va = np.where(nz < 0.0, 0.13 + 0.26 * fres, 0.28 + 0.72 * fres)
+            va += 0.42 * np.exp(-((verts[:, 1] - self._scan) / 0.13) ** 2)
+        va *= self._fade * (0.80 + 0.45 * amp)
+        # The chin mesh is dense and its lattice reads as a cage over the
+        # smoothest part of the skin, so it fades out towards the jaw while the
+        # forehead and temples keep the structure. The neck keeps almost none.
+        va *= 0.30 + 0.70 * np.clip((verts[:, 1] + 0.55) / 0.45, 0.0, 1.0)
+        va[self._n_head:] *= 0.15
+
+        ea = 0.5 * (va[self._e0] + va[self._e1])
+        keep = np.flatnonzero(ea > _MIN_ALPHA)
+        if keep.size == 0:
+            return
+
+        # Sort by opacity bucket once so each bucket is a contiguous *slice* of
+        # one QLineF list; masking and rebuilding per bucket cost more than the
+        # drawing itself.
+        bucket = np.clip((ea[keep] * _BUCKETS).astype(np.int32), 0, _BUCKETS - 1)
+        order = np.argsort(bucket, kind="stable")
+        keep = keep[order]
+        bounds = np.searchsorted(bucket[order], np.arange(_BUCKETS + 1))
+
+        e0, e1 = self._e0[keep], self._e1[keep]
+        quad = np.stack([xs[e0], ys[e0], xs[e1], ys[e1]], axis=1).tolist()
+        lines = [QLineF(q[0], q[1], q[2], q[3]) for q in quad]
+
+        skin = _blend(bg, QColor(150, 232, 245), 255) if self.shaded else bg
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for b in range(_BUCKETS):
+            lo, hi = int(bounds[b]), int(bounds[b + 1])
+            if hi <= lo:
+                continue
+            seg = lines[lo:hi]
+            a = 255.0 * min(1.0, (b + 0.5) / _BUCKETS)
+            if self.shaded:
+                # Over lit skin the lattice is a luminous seam, not a shadow:
+                # pre-mixed against a pale tone so it stays on the fast opaque
+                # path while reading as etched light.
+                p.setPen(QPen(_blend(skin, QColor(235, 255, 255), a * 0.52), 1.0))
+            else:
+                p.setPen(QPen(_blend(bg, primary, a), 1.0))
+            p.drawLines(seg)
+
+    # ── face ────────────────────────────────────────────────────────────────
+
+    def _ring(self, xs, ys, idx) -> QPolygonF:
+        return QPolygonF([QPointF(float(x), float(y))
+                          for x, y in zip(xs[idx], ys[idx])])
+
+    def _paint_features(self, p: QPainter, xs, ys, norms, r: float,
+                        primary: QColor, accent: QColor, bg: QColor,
+                        amp: float) -> None:
+        """Eyes, brows and the mouth cavity, drawn from the real landmark rings.
+
+        The canonical model's eyes and lips are closed skin — the geometry gives
+        the *shape* of the lids and mouth but no opening, so the openings are
+        painted here, exactly on the landmarks that bound them.
+        """
+        face = max(0.0, math.cos(self._yaw) * math.cos(self._pitch)) ** 2
+        if face < 0.02:
+            return
+
+        lm = self._lm
+        vis = 1.0 - self._blink
+
+        # ── eyes ────────────────────────────────────────────────────────────
+        for key in ("eye_l", "eye_r"):
+            idx = lm[key]
+            ex, ey = xs[idx], ys[idx]
+            mid_y = float(ey.mean())
+            if vis < 0.999:
+                ey = mid_y + (ey - mid_y) * max(0.04, vis)
+            poly = QPolygonF([QPointF(float(a), float(b)) for a, b in zip(ex, ey)])
+
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(_blend(bg, primary, 22)))       # socket shadow
+            p.drawPolygon(poly)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(_c(primary, 210 * face), 1.3))      # lid line
+            p.drawPolygon(poly)
+
+            if vis > 0.35:
+                br = poly.boundingRect()
+                gx = br.center().x() + self._gaze[0] * br.width() * 0.16
+                gy = br.center().y() + self._gaze[1] * br.height() * 0.20
+                cpt = QPointF(gx, gy)
+                rad = min(br.height() * 0.62, br.width() * 0.20)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(_c(accent, (70 + 60 * amp) * face * vis)))
+                p.drawEllipse(cpt, rad, rad * vis)            # iris
+                p.setBrush(QBrush(_c(accent, 245 * face * vis)))
+                p.drawEllipse(cpt, rad * 0.42, rad * 0.42 * vis)   # pupil
+
+        # ── brows ───────────────────────────────────────────────────────────
+        # On lit skin a cyan line at full theme brightness disappears into the
+        # cyan surface. Darkening it towards the background turns it back into
+        # a brow instead of a glowing decal, while the hue stays on-theme.
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen(_c(_blend(bg, primary, 105), 150 * face), 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        for key in ("brow_l", "brow_r"):
+            idx = lm[key]
+            p.drawPolyline(self._ring(xs, ys, idx))
+
+        # ── mouth ───────────────────────────────────────────────────────────
+        inner = self._ring(xs, ys, lm["lips_in"])
+        outer = self._ring(xs, ys, lm["lips_out"])
+        open_h = inner.boundingRect().height()
+
+        # Lip body first: on lit skin the outlines alone read as a scratch.
+        # The cavity, teeth and edges below draw on top of it, so an open mouth
+        # still shows its dark interior while the lips keep their colour.
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(_c(QColor(184, 120, 152), 34 * face)))
+        p.drawPolygon(outer)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        if self._mouth > 0.02:
+            # The cavity is dark but never pure black — a black oval on a glowing
+            # head reads as a hole, not a mouth. Tinting it with the theme keeps
+            # it part of the hologram.
+            p.setBrush(QBrush(_blend(bg, primary, 16 + 26 * self._mouth)))
+            p.drawPolygon(inner)
+
+            # Upper teeth: a bright strip hanging from the upper lip. It is the
+            # single cheapest thing that makes an open mouth look like speech.
+            ux, uy = xs[self._lip_up], ys[self._lip_up]
+            th = open_h * 0.30
+            pts = [QPointF(float(x), float(y)) for x, y in zip(ux, uy)]
+            pts += [QPointF(float(x), float(y) + th)
+                    for x, y in zip(ux[::-1], uy[::-1])]
+            p.setBrush(QBrush(_blend(bg, primary, 150 + 60 * self._mouth)))
+            p.drawPolygon(QPolygonF(pts))
+
+            # A warm pool at the back of the throat, strongest when wide open.
+            p.setBrush(QBrush(_c(accent, 40 * self._mouth * face)))
+            p.drawPolygon(inner)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # Lips are the one warm element on the face; a theme-coloured outline
+        # read as a scratch on the skin once the skin became lit.
+        p.setPen(QPen(_c(QColor(190, 124, 158),
+                         (135 + 60 * self._mouth) * face), 1.3))
+        p.drawPolygon(inner)                       # lip edge
+        p.setPen(QPen(_c(QColor(198, 138, 168), 90 * face), 1.1))
+        p.drawPolygon(outer)
