@@ -1,10 +1,14 @@
 /*
- * RAVAN mobile — application controller.
+ * RAVAN mobile — application controller v2.0
  *
- * One request at a time, one voice at a time. Every turn goes through the same
- * path: append the user's words, ask the backend, speak the answer, run any
- * device action the model requested, post the result back for a follow-up.
- * WhatsApp is the single action that pauses for an explicit confirmation.
+ * One request at a time, one voice at a time.
+ * Supports:
+ *   - Auto-growing message input with keyboard accommodation
+ *   - Intelligent face resizing & collapsing priority system
+ *   - Chat auto-scrolling with "Scroll to latest" badge
+ *   - File attachments (PDF, images, TXT, DOCX, CSV)
+ *   - Floating RAVAN assistant native bridge
+ *   - Audio/mic conflict prevention
  */
 
 import { Api, ApiError, loadLocalSettings, saveLocalSettings } from "./api.js";
@@ -54,6 +58,11 @@ let warnedMock = false;
 let toastTimer = 0;
 let lastBackend = "";
 
+// Face & Layout state
+let faceManualHidden = Boolean(settings.faceHidden);
+let isKeyboardOpen = false;
+let currentAttachment = null;
+
 function newId() {
   if (window.crypto?.randomUUID) return crypto.randomUUID();
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -64,13 +73,14 @@ function newId() {
 function setPhase(name) {
   phase = name;
   document.body.dataset.state = name === "offline" ? "error" : name;
-  $("state-label").textContent = LABELS[name] || name.toUpperCase();
+  const stateLabel = $("state-label");
+  if (stateLabel) stateLabel.textContent = LABELS[name] || name.toUpperCase();
   const avatarState =
     name === "idle" ? "STANDBY"
     : name === "offline" || name === "error" ? "OFFLINE"
     : name.toUpperCase();
   avatar?.setState(avatarState);
-  $("mic-btn").setAttribute("aria-pressed", String(name === "listening"));
+  $("mic-btn")?.setAttribute("aria-pressed", String(name === "listening"));
   updateStopButton();
 }
 
@@ -83,12 +93,15 @@ function syncPhase() {
 
 function updateStopButton() {
   const visible = Boolean(busy || voice?.speaking);
-  $("stop-btn").hidden = !visible;
-  $("send-btn").disabled = busy;
+  const stopBtn = $("stop-btn");
+  if (stopBtn) stopBtn.hidden = !visible;
+  const sendBtn = $("send-btn");
+  if (sendBtn) sendBtn.disabled = busy;
 }
 
 function toast(message, ms = 3200) {
   const el = $("toast");
+  if (!el) return;
   el.textContent = message;
   el.hidden = false;
   clearTimeout(toastTimer);
@@ -97,26 +110,87 @@ function toast(message, ms = 3200) {
   }, ms);
 }
 
-function addCard(kind, who, text, { speakable = false } = {}) {
+// ── Intelligent Chat Scrolling & Cards ──────────────────────────────────────
+
+function isNearBottom() {
+  const transcript = $("transcript");
+  if (!transcript) return true;
+  return (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight) < 80;
+}
+
+function scrollChatToBottom(smooth = true) {
+  const transcript = $("transcript");
+  if (!transcript) return;
+  transcript.scrollTo({
+    top: transcript.scrollHeight,
+    behavior: smooth ? "smooth" : "auto"
+  });
+  const scrollBtn = $("scroll-bottom-btn");
+  if (scrollBtn) scrollBtn.hidden = true;
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes < 0) return "0 B";
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function getFileIcon(mime = "", name = "") {
+  if (mime.startsWith("image/")) return "🖼️";
+  if (mime.includes("pdf") || name.endsWith(".pdf")) return "📄";
+  if (name.endsWith(".csv")) return "📊";
+  if (name.endsWith(".docx") || name.endsWith(".doc")) return "📝";
+  return "📎";
+}
+
+function addCard(kind, who, text, { attachment = null } = {}) {
   const transcript = $("transcript");
   $("empty-hint").hidden = true;
+  const wasBottom = isNearBottom();
+
   const card = document.createElement("div");
   card.className = `card ${kind}`;
+
   if (who) {
     const label = document.createElement("span");
     label.className = "who";
     label.textContent = who;
     card.appendChild(label);
   }
-  const body = document.createElement("div");
-  body.textContent = text;
-  card.appendChild(body);
+
+  // If this card carried an attachment, show attachment badge
+  if (attachment) {
+    const badge = document.createElement("div");
+    badge.className = "card-att-badge";
+    const icon = document.createElement("span");
+    icon.className = "badge-icon";
+    icon.textContent = getFileIcon(attachment.mime_type, attachment.name);
+    const name = document.createElement("span");
+    name.className = "badge-name";
+    name.textContent = `${attachment.name} (${formatBytes(attachment.size)})`;
+    badge.appendChild(icon);
+    badge.appendChild(name);
+    card.appendChild(badge);
+  }
+
+  if (text) {
+    const body = document.createElement("div");
+    body.textContent = text;
+    card.appendChild(body);
+  }
+
   transcript.appendChild(card);
 
-  while (transcript.querySelectorAll(".card").length > 80) {
+  while (transcript.querySelectorAll(".card").length > 100) {
     transcript.querySelector(".card")?.remove();
   }
-  transcript.scrollTop = transcript.scrollHeight;
+
+  if (wasBottom || kind === "user") {
+    scrollChatToBottom(true);
+  }
+
+  updateFaceSpace();
   return card;
 }
 
@@ -135,6 +209,7 @@ function addActionCard(call, out) {
 
 function setNet(kind, text) {
   const el = $("net-state");
+  if (!el) return;
   el.className = `net ${kind}`.trim();
   el.textContent = text;
 }
@@ -156,7 +231,99 @@ function setOnline(mode) {
   if (!busy && !voice?.speaking && !voice?.listening) setPhase("idle");
 }
 
-// ── backend health ──────────────────────────────────────────────────────────
+// ── Face Resizing & Priority System ─────────────────────────────────────────
+
+function updateFaceSpace(kbOpen) {
+  if (typeof kbOpen === "boolean") isKeyboardOpen = kbOpen;
+  const stage = $("stage");
+  if (!stage) return;
+  const transcript = $("transcript");
+  const cardCount = transcript ? transcript.querySelectorAll(".card").length : 0;
+  const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  const faceToggle = $("face-toggle-btn");
+
+  // Priority 3: Forced collapsed when keyboard is open, manually hidden, or tiny height (< 420px)
+  if (faceManualHidden || isKeyboardOpen || vh < 420) {
+    stage.className = "stage mode-collapsed";
+    avatar?.setVisible(false);
+    faceToggle?.classList.remove("active");
+  } else if (cardCount > 1 || vh < 680) {
+    // Priority 2: Limited space (active chat or compact screen) -> Compact Face
+    stage.className = "stage mode-compact";
+    avatar?.setVisible(true);
+    faceToggle?.classList.add("active");
+  } else {
+    // Priority 1: Spacious Normal Mode
+    stage.className = "stage mode-normal";
+    avatar?.setVisible(true);
+    faceToggle?.classList.add("active");
+  }
+}
+
+function toggleFaceManual() {
+  faceManualHidden = !faceManualHidden;
+  saveLocalSettings({ faceHidden: faceManualHidden });
+  updateFaceSpace();
+  toast(faceManualHidden ? "Face collapsed. Tap Face to restore." : "Face restored.");
+}
+
+// ── Auto-Growing Input & Attachments ────────────────────────────────────────
+
+function adjustInputHeight() {
+  const input = $("text-input");
+  if (!input) return;
+  input.style.height = "auto";
+  const target = Math.min(120, Math.max(42, input.scrollHeight));
+  input.style.height = `${target}px`;
+}
+
+function handleFileSelected(file) {
+  if (!file) return;
+  const maxBytes = 10 * 1024 * 1024; // 10MB
+  if (file.size > maxBytes) {
+    toast("File is too large (maximum 10 MB).", 4000);
+    return;
+  }
+
+  const isText =
+    file.type.startsWith("text/") ||
+    /\.(txt|csv|json|md|py|js|html|xml)$/i.test(file.name);
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    currentAttachment = {
+      name: file.name,
+      size: file.size,
+      mime_type: file.type || (isText ? "text/plain" : "application/octet-stream"),
+      ...(isText ? { text_content: String(reader.result) } : { data: String(reader.result) })
+    };
+
+    $("att-icon").textContent = getFileIcon(currentAttachment.mime_type, file.name);
+    $("att-name").textContent = file.name;
+    $("att-size").textContent = formatBytes(file.size);
+    $("attachment-preview").hidden = false;
+    updateFaceSpace();
+    $("text-input")?.focus();
+  };
+
+  reader.onerror = () => {
+    toast("Could not read the selected file.", 3500);
+  };
+
+  if (isText) reader.readAsText(file);
+  else reader.readAsDataURL(file);
+}
+
+function clearAttachment() {
+  currentAttachment = null;
+  const fileInput = $("file-input");
+  if (fileInput) fileInput.value = "";
+  const preview = $("attachment-preview");
+  if (preview) preview.hidden = true;
+  updateFaceSpace();
+}
+
+// ── Backend health & conversation ───────────────────────────────────────────
 
 async function checkHealth({ attempts = 3, quiet = false } = {}) {
   if (!api.configured) {
@@ -173,7 +340,7 @@ async function checkHealth({ attempts = 3, quiet = false } = {}) {
         addCard(
           "sys",
           null,
-          "Backend is in mock mode: replies are canned and no Gemini call is made. Set GEMINI_API_KEY on the server for live answers."
+          "Backend is in mock mode: replies are canned and no Gemini call is made. Set GEMINI_API_KEY on Render for live answers."
         );
       }
       if (health.auth_required && !api.token && !warnedAuth) {
@@ -199,15 +366,11 @@ async function checkHealth({ attempts = 3, quiet = false } = {}) {
 }
 
 function startHealthPolling() {
-  // A minute is enough to notice a sleeping backend without keeping a free
-  // instance awake around the clock; requests themselves refresh the state.
   setInterval(() => {
     if (document.hidden) return;
     checkHealth({ attempts: 1, quiet: true });
   }, 60000);
 }
-
-// ── conversation ────────────────────────────────────────────────────────────
 
 async function runChain(payload) {
   if (busy) {
@@ -244,7 +407,8 @@ async function step(payload, depth) {
       requestId: newId(),
       text: payload.text,
       toolResults: payload.toolResults,
-      localTime: new Date().toString()
+      localTime: new Date().toString(),
+      attachment: payload.attachment
     },
     { signal: controller.signal }
   );
@@ -351,23 +515,32 @@ function presentError(err) {
   addCard("err", null, "Something went wrong on this device. Try again.");
 }
 
-function sendText(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return;
-  if (text.length > 2000) {
-    toast("That message is too long (2000 characters max).");
+function sendCurrentTurn() {
+  const input = $("text-input");
+  const text = input ? input.value.trim() : "";
+  const att = currentAttachment;
+
+  if (!text && !att) return;
+  if (text.length > 4000) {
+    toast("That message is too long (4000 characters max).");
     return;
   }
   if (busy) {
     toast("Still answering the previous request.");
     return;
   }
+
   if (voice?.listening) voice.stopListening();
-  addCard("user", "YOU", text);
-  const input = $("text-input");
-  input.value = "";
-  input.placeholder = "Type a command…";
-  runChain({ text });
+
+  addCard("user", "YOU", text, { attachment: att });
+
+  if (input) {
+    input.value = "";
+    adjustInputHeight();
+  }
+  clearAttachment();
+
+  runChain({ text, attachment: att });
 }
 
 // ── WhatsApp confirmation ───────────────────────────────────────────────────
@@ -393,9 +566,6 @@ async function resolveWhatsApp(confirmed) {
   hideConfirm();
   if (!pending) return;
 
-  // The sheet is shown at the end of the reply chain, so `busy` is normally
-  // already false; wait briefly rather than dropping the results if a tap
-  // lands in the same frame the chain completes.
   const deadline = Date.now() + 2000;
   while (busy && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -431,7 +601,7 @@ async function resolveWhatsApp(confirmed) {
   });
 }
 
-// ── microphone and mute ─────────────────────────────────────────────────────
+// ── Microphone, Audio & Mute Coordination ───────────────────────────────────
 
 function setMuted(next, { announce = true } = {}) {
   muted = Boolean(next);
@@ -441,7 +611,7 @@ function setMuted(next, { announce = true } = {}) {
   $("cfg-mic-muted").checked = muted;
   if (muted) voice?.stopListening();
   actions?.setMicMuted(muted);
-  if (announce) toast(muted ? "Microphone muted. RAVAN will not listen." : "Microphone on.");
+  if (announce) toast(muted ? "Microphone muted." : "Microphone active.");
   syncPhase();
 }
 
@@ -451,11 +621,13 @@ async function toggleMic() {
     voice.stopListening();
     return;
   }
-  if (busy) interrupt();
+
+  // Interruption: if AI is speaking or thinking, abort immediately before opening mic
+  if (busy || voice.speaking) interrupt();
   if (muted) setMuted(false, { announce: false });
 
   if (!voice.canListen) {
-    toast("Voice input is not available here. Type your command instead.");
+    toast("Voice recognition is not available here. Type your command instead.");
     return;
   }
 
@@ -465,7 +637,7 @@ async function toggleMic() {
 
   const allowed = await voice.ensureMicPermission();
   if (!allowed) {
-    toast("Microphone permission is needed. Allow it to use voice, or type instead.");
+    toast("Microphone permission required for voice.", 3500);
     return;
   }
   if (muted) return;
@@ -474,7 +646,7 @@ async function toggleMic() {
   voice.listenOnce({ lang: navigator.language || "en-US" });
 }
 
-// ── settings ────────────────────────────────────────────────────────────────
+// ── Settings & Floating Assistant ───────────────────────────────────────────
 
 function openSettings() {
   $("settings-sheet").hidden = false;
@@ -498,24 +670,31 @@ function closeSettings() {
 }
 
 async function toggleFloating(wanted) {
-  const el = $("cfg-floating");
-  el.disabled = true;
+  const checkbox = $("cfg-floating");
+  const quickBtn = $("quick-floating-btn");
+  if (checkbox) checkbox.disabled = true;
+  if (quickBtn) quickBtn.disabled = true;
+
   try {
     const out = await actions.setFloating(wanted);
     if (!out?.ok) {
-      el.checked = !wanted;
+      if (checkbox) checkbox.checked = !wanted;
+      if (quickBtn) quickBtn.classList.toggle("active", !wanted);
       if (out?.permissionRequired) {
-        toast("Allow “display over other apps” for RAVAN, then try again.", 4800);
+        toast("Allow “display over other apps” for RAVAN in Android settings, then try again.", 5000);
       } else {
-        toast(out?.detail || "The floating icon could not be changed.", 4200);
+        toast(out?.detail || "Could not toggle floating assistant.", 4200);
       }
       return;
     }
-    el.checked = Boolean(out.enabled);
-    saveLocalSettings({ floating: el.checked });
-    toast(el.checked ? "Floating RAVAN enabled." : "Floating RAVAN hidden.");
+    const active = Boolean(out.enabled);
+    if (checkbox) checkbox.checked = active;
+    if (quickBtn) quickBtn.classList.toggle("active", active);
+    saveLocalSettings({ floating: active });
+    toast(active ? "Floating assistant enabled." : "Floating assistant hidden.");
   } finally {
-    el.disabled = false;
+    if (checkbox) checkbox.disabled = false;
+    if (quickBtn) quickBtn.disabled = false;
   }
 }
 
@@ -524,30 +703,55 @@ async function syncNativeState() {
   $("native-section").hidden = false;
   const state = await actions.floatingState();
   if (!state) return;
-  $("cfg-floating").checked = Boolean(state.enabled);
+  const isEnabled = Boolean(state.enabled);
+  $("cfg-floating").checked = isEnabled;
+  $("quick-floating-btn")?.classList.toggle("active", isEnabled);
+
   if (typeof state.muted === "boolean" && state.muted !== muted) {
     setMuted(state.muted, { announce: false });
   }
   if (state.canDraw === false) {
     $("floating-note").textContent =
-      "Overlay permission is not granted yet. Turning this on asks for it once: allow “display over other apps”, then RAVAN's icon can appear over other apps.";
+      "Overlay permission is not granted yet. Enabling asks for it once: allow “display over other apps”, then RAVAN's floating icon can appear.";
   }
 }
 
-// ── wiring ──────────────────────────────────────────────────────────────────
+// ── Wiring & Event Handlers ─────────────────────────────────────────────────
 
 function wire() {
-  $("send-btn").addEventListener("click", () => sendText($("text-input").value));
+  // Input & Send
+  $("send-btn").addEventListener("click", sendCurrentTurn);
   $("text-input").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
+    if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      sendText($("text-input").value);
+      sendCurrentTurn();
     }
   });
-  $("mic-btn").addEventListener("click", () => toggleMic());
-  $("stop-btn").addEventListener("click", () => interrupt());
+  $("text-input").addEventListener("input", adjustInputHeight);
+
+  // File Attachments
+  $("attach-btn").addEventListener("click", () => {
+    $("file-input").click();
+  });
+  $("file-input").addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    if (file) handleFileSelected(file);
+  });
+  $("att-remove").addEventListener("click", clearAttachment);
+
+  // Mic & Stop
+  $("mic-btn").addEventListener("click", toggleMic);
+  $("stop-btn").addEventListener("click", interrupt);
   $("muted-chip").addEventListener("click", () => setMuted(false));
 
+  // Face toggle & Quick floating toggle
+  $("face-toggle-btn").addEventListener("click", toggleFaceManual);
+  $("quick-floating-btn").addEventListener("click", () => {
+    const currentState = $("quick-floating-btn").classList.contains("active");
+    toggleFloating(!currentState);
+  });
+
+  // Settings
   $("settings-btn").addEventListener("click", openSettings);
   $("settings-close").addEventListener("click", closeSettings);
   $("settings-sheet").addEventListener("click", (event) => {
@@ -575,9 +779,9 @@ function wire() {
   });
 
   $("btn-exit").addEventListener("click", async () => {
-    if (!window.confirm("Exit RAVAN and hide the floating icon?")) return;
+    if (!window.confirm("Exit RAVAN and hide the floating assistant?")) return;
     const exited = await actions.exit();
-    if (!exited) toast("Exit is handled by the Android build.");
+    if (!exited) toast("Exit handled by Android.");
   });
 
   $("offline-retry").addEventListener("click", () => {
@@ -585,19 +789,40 @@ function wire() {
     else checkHealth({ attempts: 2 });
   });
 
+  // WhatsApp Confirm
   $("confirm-ok").addEventListener("click", () => resolveWhatsApp(true));
   $("confirm-cancel").addEventListener("click", () => resolveWhatsApp(false));
   $("confirm-sheet").addEventListener("click", (event) => {
     if (event.target === $("confirm-sheet")) resolveWhatsApp(false);
   });
 
+  // Visual Viewport & Keyboard Resizing
+  if (window.visualViewport) {
+    const handleViewport = () => {
+      const vh = window.visualViewport.height;
+      document.documentElement.style.setProperty("--vvh", `${vh}px`);
+      const diff = window.innerHeight - vh;
+      const kb = diff > 120;
+      document.body.classList.toggle("keyboard-open", kb);
+      updateFaceSpace(kb);
+      if (kb) {
+        setTimeout(() => scrollChatToBottom(false), 60);
+      }
+    };
+    window.visualViewport.addEventListener("resize", handleViewport);
+    window.visualViewport.addEventListener("scroll", handleViewport);
+  }
+
+  // Network & Visibility
   window.addEventListener("online", () => checkHealth({ attempts: 1, quiet: true }));
   window.addEventListener("offline", () => setOffline("Your device is offline."));
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       voice?.stopListening();
+      avatar?.setVisible(false);
     } else {
+      updateFaceSpace();
       if (offline) checkHealth({ attempts: 1, quiet: true });
       syncNativeState();
     }
@@ -606,8 +831,13 @@ function wire() {
   const capApp = window.Capacitor?.Plugins?.App;
   if (capApp?.addListener) {
     capApp.addListener("appStateChange", ({ isActive }) => {
-      if (!isActive) voice?.stopListening();
-      else if (offline) checkHealth({ attempts: 1, quiet: true });
+      if (!isActive) {
+        voice?.stopListening();
+        avatar?.setVisible(false);
+      } else {
+        updateFaceSpace();
+        if (offline) checkHealth({ attempts: 1, quiet: true });
+      }
     }).catch?.(() => {});
   }
 }
@@ -616,11 +846,11 @@ async function boot() {
   api = new Api();
   actions = new Actions();
 
-  $("cfg-backend").value = settings.backendUrl || window.RAVAN_CONFIG?.backendUrl || "";
+  $("cfg-backend").value = settings.backendUrl || window.RAVAN_CONFIG?.backendUrl || "https://ravanai-wn4a.onrender.com";
   $("cfg-token").value = settings.apiToken || "";
   $("cfg-voice").checked = voiceEnabled;
   $("cfg-mic-muted").checked = muted;
-  $("about-version").textContent = `RAVAN ${window.RAVAN_CONFIG?.version || "mobile"}`;
+  $("about-version").textContent = `RAVAN ${window.RAVAN_CONFIG?.version || "mobile v2.0"}`;
   lastBackend = $("cfg-backend").value.trim();
 
   voice = new Voice({
@@ -628,21 +858,25 @@ async function boot() {
       if (state === "listening") {
         setPhase("listening");
       } else {
-        $("text-input").placeholder = "Type a command…";
+        const input = $("text-input");
+        if (input) input.placeholder = "Type a message or command…";
         syncPhase();
       }
     },
     onPartial: (text) => {
-      $("text-input").placeholder = text ? `“${text}”` : "Listening…";
+      const input = $("text-input");
+      if (input) input.placeholder = text ? `“${text}”` : "Listening…";
     },
     onFinal: (text) => {
       const clean = String(text || "").trim();
-      $("text-input").placeholder = "Type a command…";
+      const input = $("text-input");
+      if (input) input.placeholder = "Type a message or command…";
       if (!clean || muted) {
         syncPhase();
         return;
       }
-      sendText(clean);
+      if (input) input.value = clean;
+      sendCurrentTurn();
     },
     onError: (message) => {
       toast(message, 4200);
@@ -662,6 +896,7 @@ async function boot() {
   setMuted(muted, { announce: false });
   setPhase("idle");
   updateStopButton();
+  updateFaceSpace();
 
   if (actions.isNative) {
     syncNativeState();
@@ -669,28 +904,30 @@ async function boot() {
       const next = Boolean(event?.muted);
       if (next !== muted) {
         setMuted(next, { announce: false });
-        toast(next ? "Microphone muted from the floating icon." : "Microphone on.");
+        toast(next ? "Microphone muted from floating icon." : "Microphone active.");
       }
     });
   }
 
   await checkHealth();
   startHealthPolling();
-  $("text-input").focus();
 }
 
 window.addEventListener("error", (event) => {
-  // A single failing frame must not take the whole interface down silently.
   if (event?.error) console.error("[RAVAN]", event.error);
 });
 
 window.__ravan = {
-  send: (text) => sendText(text),
+  send: (text) => {
+    $("text-input").value = text;
+    sendCurrentTurn();
+  },
   phase: () => phase,
   muted: () => muted,
   speak: (text) => speakReply(text, []),
   confirm: (ok) => resolveWhatsApp(Boolean(ok)),
-  avatar: () => avatar
+  avatar: () => avatar,
+  updateFaceSpace: () => updateFaceSpace()
 };
 
 boot().catch((err) => {

@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#02070c">
-  <meta name="description" content="RAVAN AI — your phone assistant. Voice, text and device actions.">
+  <meta name="description" content="RAVAN AI — your intelligent phone assistant. Voice, text, file analysis and device actions.">
   <title>RAVAN AI</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -20,7 +20,15 @@
         <span class="brand-name">RAVAN</span>
         <span class="brand-sub">AI</span>
       </div>
-      <div class="top-right">
+      <div class="top-controls">
+        <button class="topbar-pill" id="face-toggle-btn" type="button" aria-label="Toggle Face Avatar" title="Toggle Face Visibility">
+          <svg class="topbar-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+          <span class="pill-text">Face</span>
+        </button>
+        <button class="topbar-pill" id="quick-floating-btn" type="button" aria-label="Toggle Floating Assistant" title="Toggle Floating Assistant">
+          <span class="orb-dot"></span>
+          <span class="pill-text">Floating</span>
+        </button>
         <span class="net" id="net-state" role="status">CONNECTING</span>
         <button class="icon-btn" id="settings-btn" aria-label="Settings" title="Settings">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8.4 3.5c0-.5 0-.9-.1-1.4l2-1.6-1.9-3.3-2.4 1a7.6 7.6 0 0 0-2.4-1.4L15.3 2h-3.8l-.4 2.4c-.9.3-1.7.8-2.4 1.4l-2.4-1L4.4 8l2 1.6a8 8 0 0 0 0 2.8l-2 1.6 1.9 3.3 2.4-1c.7.6 1.5 1.1 2.4 1.4l.4 2.4h3.8l.4-2.4c.9-.3 1.7-.8 2.4-1.4l2.4 1 1.9-3.3-2-1.6c.1-.5.1-.9.1-1.4Z"/></svg>
@@ -33,10 +41,10 @@
       <button type="button" id="offline-retry">Retry</button>
     </div>
 
-    <main class="stage">
-      <div class="avatar-wrap">
+    <main class="stage" id="stage">
+      <div class="avatar-wrap" id="avatar-wrap">
         <canvas id="avatar" aria-label="RAVAN's animated face"></canvas>
-        <div class="status-row">
+        <div class="status-row" id="status-row">
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
           <span class="status-label" id="state-label" role="status" aria-live="polite">STANDBY</span>
           <button class="muted-chip" id="muted-chip" type="button" title="Unmute microphone" hidden>MIC MUTED</button>
@@ -46,28 +54,52 @@
       <section class="transcript" id="transcript" aria-live="polite" aria-label="Conversation">
         <div class="empty-hint" id="empty-hint">
           <p>Tap the microphone and speak, or type a command.</p>
-          <p class="dim">Try “Open YouTube”, “Play Believer”, “Open WhatsApp”.</p>
+          <p class="dim">Try “Open YouTube”, “Play Believer”, or attach a PDF / Image.</p>
         </div>
       </section>
+
+      <button class="scroll-bottom-btn glass" id="scroll-bottom-btn" type="button" aria-label="Scroll to latest messages" hidden>
+        <span>↓ Latest messages</span>
+      </button>
     </main>
 
-    <footer class="dock">
+    <footer class="dock" id="dock">
+      <!-- Attachment preview container -->
+      <div class="attachment-preview glass" id="attachment-preview" hidden>
+        <div class="att-info">
+          <span class="att-icon" id="att-icon">📎</span>
+          <div class="att-text">
+            <span class="att-name" id="att-name">document.pdf</span>
+            <span class="att-size" id="att-size">1.2 MB</span>
+          </div>
+        </div>
+        <button class="att-remove" id="att-remove" type="button" aria-label="Remove attachment" title="Remove attachment">✕</button>
+      </div>
+
       <div class="composer glass">
-        <button class="mic-btn" id="mic-btn" aria-label="Start listening" aria-pressed="false" title="Speak to RAVAN">
+        <!-- Hidden file input -->
+        <input type="file" id="file-input" hidden accept=".pdf,.txt,.docx,.csv,.jpg,.jpeg,.png,.webp,.md,.json,image/*,text/*,application/pdf">
+        <button class="action-btn attach-btn" id="attach-btn" type="button" aria-label="Attach file" title="Attach file (PDF, TXT, DOCX, CSV, Images)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5a2.5 2.5 0 0 1 5 0v10.5c0 .83-.67 1.5-1.5 1.5s-1.5-.67-1.5-1.5V6H9v9.5a3 3 0 0 0 6 0V5a4 4 0 0 0-8 0v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5Z"/></svg>
+        </button>
+
+        <button class="action-btn mic-btn" id="mic-btn" type="button" aria-label="Start listening" aria-pressed="false" title="Speak to RAVAN">
           <svg class="ico-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2Z"/></svg>
           <svg class="ico-mute" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18-1.4 1.4L3 4.4 3 3Zm9 11a3 3 0 0 0 3-3V6a3 3 0 0 0-5.6-1.5L15 12.7c-.6.8-1.5 1.3-2.5 1.3h-.5Zm5-3h2a7 7 0 0 1-3 5.7V21h-2v-3.1a7 7 0 0 1-2-.7l1.5-1.5c.4.2.9.3 1.5.3a5 5 0 0 0 5-5v-1Z"/></svg>
         </button>
-        <input id="text-input" class="text-input" type="text" inputmode="text"
+
+        <textarea id="text-input" class="text-input" rows="1"
                autocomplete="off" autocapitalize="sentences" spellcheck="false"
-               maxlength="2000" placeholder="Type a command…" aria-label="Command">
-        <button class="stop-btn" id="stop-btn" aria-label="Stop" title="Stop speaking" hidden>
+               maxlength="4000" placeholder="Type a message or command…" aria-label="Command"></textarea>
+
+        <button class="action-btn stop-btn" id="stop-btn" type="button" aria-label="Stop" title="Stop speaking" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
         </button>
-        <button class="send-btn" id="send-btn" aria-label="Send" title="Send">
+        <button class="action-btn send-btn" id="send-btn" type="button" aria-label="Send" title="Send message">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 21 3l-8.5 18-2.1-6.4L3 11.5Zm7.6 2.9 5.2-5.2-6.7 3.3 1.5 1.9Z"/></svg>
         </button>
       </div>
-      <p class="dock-hint" id="dock-hint">Voice needs microphone permission. Typing always works.</p>
+      <p class="dock-hint" id="dock-hint">Voice needs mic permission. You can type or attach files anytime.</p>
     </footer>
   </div>
 
@@ -81,8 +113,8 @@
       <div class="sheet-body">
         <label class="field">
           <span>Backend URL</span>
-          <input id="cfg-backend" type="url" placeholder="https://your-service.onrender.com" autocomplete="url">
-          <small>For GitHub Pages builds. Leave empty when the backend serves this page.</small>
+          <input id="cfg-backend" type="url" placeholder="https://ravanai-wn4a.onrender.com" autocomplete="url">
+          <small>Render service URL for cloud backend. The frontend connects here.</small>
         </label>
         <label class="field">
           <span>Access token <em>(optional)</em></span>
@@ -97,18 +129,18 @@
           <input type="checkbox" id="cfg-mic-muted">
           <span>Microphone muted</span>
         </label>
+        <div class="sheet-divider">ASSISTANT CONTROLS</div>
+        <label class="toggle">
+          <input type="checkbox" id="cfg-floating">
+          <span>Enable Floating Assistant</span>
+        </label>
+        <p class="fine" id="floating-note">Displays a draggable floating RAVAN AI orb over other applications. Tapping the orb lets you interact with RAVAN.</p>
         <div class="native-only" id="native-section" hidden>
-          <div class="sheet-divider">ANDROID</div>
-          <label class="toggle">
-            <input type="checkbox" id="cfg-floating">
-            <span>Floating RAVAN icon</span>
-          </label>
-          <p class="fine" id="floating-note">Requires the “display over other apps” permission. The icon has a mic toggle and opens the app on tap.</p>
           <button class="btn ghost" id="btn-exit" type="button">Exit RAVAN</button>
         </div>
         <div class="about">
           <span id="about-mode">Connected</span>
-          <span id="about-version">RAVAN mobile</span>
+          <span id="about-version">RAVAN mobile v2.0</span>
         </div>
       </div>
     </section>

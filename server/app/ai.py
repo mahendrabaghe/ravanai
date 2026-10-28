@@ -142,6 +142,10 @@ def _mock_response(session: Session, contents):
         fc.name, fc.args, fc.id = name, args, f"mock-{int(time.time()*1000)}"
         r.function_calls.append(fc)
 
+    has_att = any(
+        getattr(p, "inline_data", None) is not None or "[Attached" in (getattr(p, "text", "") or "")
+        for p in (getattr(last, "parts", []) or [])
+    )
     if results:
         fr = results[-1]
         res = {}
@@ -152,6 +156,8 @@ def _mock_response(session: Session, contents):
         status = res.get("detail") or ("done" if res.get("ok") else "not completed")
         status = str(status).strip().rstrip(".")
         r.text = f"Done. {str(fr.name).replace('_', ' ')}: {status}."
+    elif has_att:
+        r.text = "I have received and inspected your attached file. What would you like to know or do with it?"
     elif "whatsapp" in low:
         call("compose_whatsapp_message", {
             "contact": "",
@@ -206,10 +212,38 @@ def _append_model_content(session: Session, resp) -> None:
 
 
 async def run_user_turn(session: Session, text: str,
-                        local_time: str | None = None) -> dict:
+                        local_time: str | None = None,
+                        attachment: dict | None = None) -> dict:
     types = _types()
-    session.history.append(types.Content(
-        role="user", parts=[types.Part(text=text)]))
+    parts = []
+
+    if attachment:
+        name = str(attachment.get("name") or "file")
+        mime = str(attachment.get("mime_type") or "application/octet-stream")
+        data_b64 = attachment.get("data")
+        text_content = attachment.get("text_content")
+
+        if data_b64:
+            import base64
+            try:
+                b64_str = str(data_b64)
+                if "," in b64_str:
+                    b64_str = b64_str.split(",", 1)[1]
+                raw_bytes = base64.b64decode(b64_str)
+                parts.append(types.Part.from_bytes(data=raw_bytes, mime_type=mime))
+            except Exception as e:
+                print(f"[RAVAN] attachment decode failed: {e}")
+                parts.append(types.Part(text=f"[Attached File: {name}]"))
+        elif text_content:
+            parts.append(types.Part(text=f"[Attached File {name}]:\n{text_content}"))
+        else:
+            parts.append(types.Part(text=f"[Attached File: {name}]"))
+
+    msg = text if text else ("Please inspect this attached file." if attachment else "")
+    if msg:
+        parts.append(types.Part(text=msg))
+
+    session.history.append(types.Content(role="user", parts=parts))
     session.pending = []
 
     resp = await _generate(session, session.history, local_time)

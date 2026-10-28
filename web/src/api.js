@@ -76,9 +76,9 @@ export class Api {
   setConfig({ backendUrl, apiToken } = {}) {
     const stored = loadLocalSettings();
     const cfg = window.RAVAN_CONFIG || {};
-    const raw = backendUrl ?? stored.backendUrl ?? cfg.backendUrl ?? "";
+    const raw = backendUrl || stored.backendUrl || cfg.backendUrl || "https://ravanai-wn4a.onrender.com";
     this.baseUrl = normaliseBase(raw) || sameOriginBase();
-    this.token = apiToken ?? stored.apiToken ?? cfg.apiToken ?? "";
+    this.token = apiToken || stored.apiToken || cfg.apiToken || "";
     return this;
   }
 
@@ -179,11 +179,12 @@ export class Api {
    * One chat turn. `requestId` is reused across retries on purpose: the server
    * returns the cached reply instead of calling the model twice.
    */
-  async chat({ sessionId, requestId, text, toolResults, localTime }, opts = {}) {
+  async chat({ sessionId, requestId, text, toolResults, localTime, attachment }, opts = {}) {
     const body = { session_id: sessionId, request_id: requestId };
     if (text) body.text = text;
     if (toolResults) body.tool_results = toolResults;
     if (localTime) body.local_time = localTime;
+    if (attachment) body.attachment = attachment;
 
     const attempt = async (timeout) =>
       this._fetch("/api/chat", {

@@ -109,12 +109,21 @@ def _auth(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+class AttachmentModel(BaseModel):
+    name: str = Field(max_length=256)
+    mime_type: str = Field(default="application/octet-stream", max_length=128)
+    data: str | None = None  # base64 encoded data
+    text_content: str | None = None  # extracted/direct text
+    size: int | None = None
+
+
 class ChatBody(BaseModel):
     session_id: str = Field(min_length=4, max_length=64)
     request_id: str = Field(min_length=4, max_length=64)
-    text: str | None = Field(default=None, max_length=4000)
+    text: str | None = Field(default=None, max_length=8000)
     tool_results: list[dict] | None = None
     local_time: str | None = Field(default=None, max_length=80)
+    attachment: AttachmentModel | None = None
 
 
 @app.get("/health")
@@ -135,9 +144,15 @@ async def health():
 async def chat(body: ChatBody):
     text = (body.text or "").strip()
     has_results = bool(body.tool_results)
-    if bool(text) == has_results:
+    has_attachment = bool(body.attachment)
+    if not (bool(text) or has_results or has_attachment):
         return JSONResponse(
-            {"detail": "Send either text or tool_results, not both."},
+            {"detail": "Send text, an attachment, or tool_results."},
+            status_code=400,
+        )
+    if has_results and (text or has_attachment):
+        return JSONResponse(
+            {"detail": "Send either tool_results or a user message/attachment, not both."},
             status_code=400,
         )
     if text and len(text) > settings.max_text:
@@ -160,7 +175,10 @@ async def chat(body: ChatBody):
             payload = await run_tool_continuation(
                 session, body.tool_results, body.local_time)
         else:
-            payload = await run_user_turn(session, text, body.local_time)
+            payload = await run_user_turn(
+                session, text, body.local_time,
+                attachment=body.attachment.model_dump() if body.attachment else None
+            )
         session.remember_reply(body.request_id, payload)
         return payload
     except AIUnavailable as exc:

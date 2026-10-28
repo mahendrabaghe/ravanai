@@ -211,6 +211,22 @@ export class Avatar {
     this._kick();
   }
 
+  setVisible(visible) {
+    const next = Boolean(visible) && !document.hidden;
+    if (this._visible === next) return;
+    this._visible = next;
+    if (next) {
+      this._last = 0;
+      this.resize();
+      if (this._running) this._kick();
+    } else {
+      if (this._raf) {
+        cancelAnimationFrame(this._raf);
+        this._raf = 0;
+      }
+    }
+  }
+
   setState(state) {
     this.state = String(state || "STANDBY").toUpperCase();
   }
