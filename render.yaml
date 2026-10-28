@@ -30,7 +30,7 @@ services:
       # Pin this to the Pages origin and the APK's WebView origin. "*" works but
       # lets any site call your endpoint with the token in its own page.
       - key: ALLOWED_ORIGINS
-        value: "https://YOURNAME.github.io,https://localhost"
+        value: "https://mahendrabaghe.github.io,https://localhost,https://ravanai-wn4a.onrender.com,*"
 
       - key: RAVAN_MOCK
         value: "0"

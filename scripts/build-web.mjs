@@ -10,7 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const src = resolve(root, "web");
 const out = resolve(root, "www");
 
-const backendUrl = String(process.env.RAVAN_BACKEND_URL || "").trim().replace(/\/+$/, "");
+const backendUrl = String(process.env.RAVAN_BACKEND_URL || "https://ravanai-wn4a.onrender.com").trim().replace(/\/+$/, "");
 const local = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(backendUrl);
 if (backendUrl && !/^https:\/\//i.test(backendUrl) && !local) {
   console.error("RAVAN_BACKEND_URL must be https:// (http is allowed only for localhost).");

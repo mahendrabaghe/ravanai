@@ -28,7 +28,7 @@ jobs:
         run: |
           url="${{ vars.RAVAN_BACKEND_URL }}"
           if [ -z "$url" ]; then
-            echo "::warning::RAVAN_BACKEND_URL is not set. The page will open Settings and ask for a URL."
+            url="https://ravanai-wn4a.onrender.com"
           fi
           cat > web/config.js <<EOF
           window.RAVAN_CONFIG = {

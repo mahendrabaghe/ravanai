@@ -31,8 +31,9 @@ export function saveLocalSettings(patch) {
 }
 
 function normaliseBase(url) {
-  const value = String(url || "").trim().replace(/\/+$/, "");
+  let value = String(url || "").trim().replace(/\/+$/, "");
   if (!value) return "";
+  value = value.replace(/\/app$/i, "");
   const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(value);
   if (!/^https:\/\//i.test(value) && !isLocal) {
     throw new ApiError(

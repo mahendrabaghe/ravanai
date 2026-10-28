@@ -10,7 +10,7 @@
  *   backendUrl: "https://ravan-ai.onrender.com" → GitHub Pages / APK
  */
 window.RAVAN_CONFIG = {
-  backendUrl: "",
+  backendUrl: "https://ravanai-wn4a.onrender.com",
   apiToken: "",
   version: "1.0.0"
 };
