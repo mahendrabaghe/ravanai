@@ -18,6 +18,18 @@ ROOT = Path(__file__).resolve().parents[2]
 # Where the assistant's own prompt lives. Reused verbatim from the desktop app.
 PROMPT_FILE = ROOT / "core" / "prompt.txt"
 
+# Auto-load .env if present (root or server/)
+for _candidate in (ROOT / ".env", ROOT / "server" / ".env"):
+    if _candidate.is_file():
+        try:
+            for _line in _candidate.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    os.environ.setdefault(_k.strip(), _v.strip())
+        except Exception:
+            pass
+
 
 def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
@@ -44,6 +56,13 @@ class Settings:
     mock_delay: float = _env_float("RAVAN_MOCK_DELAY", 0.15)
 
     gemini_api_key: str = _env("GEMINI_API_KEY")
+    if not gemini_api_key:
+        try:
+            import json
+            _kd = json.loads((ROOT / "config" / "api_keys.json").read_text(encoding="utf-8"))
+            gemini_api_key = str(_kd.get("gemini_api_key") or "").strip()
+        except Exception:
+            gemini_api_key = ""
     # Explicit REST model. The desktop's own ladder (core/gemini.py) still sits
     # behind this choice, so a quota error falls through to the next rung.
     model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
